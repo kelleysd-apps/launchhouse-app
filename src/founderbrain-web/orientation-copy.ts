@@ -63,10 +63,10 @@ export function contentScreens(track: FounderTrack | null): TypeformScreen[] {
     track === "b2c"
       ? {
           id: "instagram",
-          title: "Instagram as Business",
+          title: "Instagram (optional)",
           body: [
-            "Instagram is optional. It does not block picking a workflow.",
-            "Enter the handle you will post from, or leave it blank and continue.",
+            "Not everyone uses Instagram. You do not need an account to complete this chapter.",
+            "If you have a handle you plan to post from, enter it here. Otherwise, leave this blank and continue.",
           ],
           textField: {
             key: "instagramHandle",

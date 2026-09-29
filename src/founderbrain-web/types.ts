@@ -40,6 +40,7 @@ export interface Config {
   siteImportEnabled?: boolean;
   routinesEnabled?: boolean;
   mediaEnabled?: boolean;
+  uploadsEnabled?: boolean;
 }
 export interface RoutineDraft {
   id: string;
@@ -122,3 +123,18 @@ export type HiggsfieldStatus = {
   spentUsd: number;
   capUsd: number;
 };
+
+/** A founder-uploaded file (GET/POST/DELETE /api/uploads). */
+export type UploadItem = {
+  id: string;
+  name: string;
+  ext: string;
+  sizeBytes: number;
+  questionKey: string | null;
+  createdAt: string;
+  readable: "text" | "no_text";
+  textChars: number;
+  ai: "full" | "partial" | "excluded" | "unreadable";
+};
+
+export type UploadsAi = { budgetBytes: number; usedBytes: number };

@@ -11,6 +11,10 @@ CREATE TABLE IF NOT EXISTS fb_ai_job (
 -- Lifetime key spend already applied for this job (uncertain/partial paths). Reconcile adds only the delta.
 ALTER TABLE fb_ai_job ADD COLUMN IF NOT EXISTS openrouter_spend_recorded_microusd bigint NOT NULL DEFAULT 0
   CHECK (openrouter_spend_recorded_microusd >= 0);
+-- sha256 over the uploaded documents this job was pinned with (see uploads.ts's
+-- allocateDocumentContext). NULL on a job enqueued before uploads existed, treated
+-- as the empty-corpus hash by every comparison against it.
+ALTER TABLE fb_ai_job ADD COLUMN IF NOT EXISTS uploads_hash text;
 CREATE TABLE IF NOT EXISTS fb_job_dispatch (
  job_id text PRIMARY KEY REFERENCES fb_ai_job(id) ON DELETE CASCADE,
  founder_id text NOT NULL REFERENCES founder(id) ON DELETE CASCADE,
@@ -28,6 +32,7 @@ CREATE TABLE IF NOT EXISTS fb_artifact (
  UNIQUE(founder_id,job_id), FOREIGN KEY(founder_id,job_id) REFERENCES fb_ai_job(founder_id,id) ON DELETE CASCADE,
  FOREIGN KEY(founder_id,draft_sha) REFERENCES ge_blob(founder_id,sha)
 );
+ALTER TABLE fb_artifact ADD COLUMN IF NOT EXISTS uploads_hash text;
 ALTER TABLE fb_ai_job ENABLE ROW LEVEL SECURITY;
 ALTER TABLE fb_ai_job FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS fb_job_tenant ON fb_ai_job;

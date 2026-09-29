@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { SlidingWindowLimiter, mutationKey } from "./rate-limit.ts";
+import { MUTATION_PATHS, SlidingWindowLimiter, mutationKey } from "./rate-limit.ts";
 
 test("sliding window allows then refuses within the window", () => {
   let now = 1_000;
@@ -17,4 +17,14 @@ test("sliding window allows then refuses within the window", () => {
 test("mutationKey normalises artifact accept paths", () => {
   assert.equal(mutationKey("POST", "/api/artifact/abc/accept"), "POST /api/artifact/:id/accept");
   assert.equal(mutationKey("PUT", "/api/brain"), "PUT /api/brain");
+});
+
+test("uploads routes are rate limited as mutations", () => {
+  assert.ok(MUTATION_PATHS.has("POST /api/uploads"));
+  assert.ok(MUTATION_PATHS.has("DELETE /api/uploads/:id"));
+  assert.equal(mutationKey("POST", "/api/uploads?filename=a.txt"), "POST /api/uploads");
+  assert.equal(
+    mutationKey("DELETE", "/api/uploads/0b8f7d1e-1a2b-4c3d-8e9f-0123456789ab"),
+    "DELETE /api/uploads/:id",
+  );
 });

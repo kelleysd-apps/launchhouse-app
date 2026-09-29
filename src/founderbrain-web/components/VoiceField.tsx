@@ -2,10 +2,132 @@
  * Typeform text field with optional Web Speech dictation.
  */
 import { useEffect, useRef, useState } from "react";
+import "../uploads.css";
+import { useUploads } from "./UploadsContext";
+import {
+  ALLOWED_UPLOAD_EXTENSIONS,
+  MAX_UPLOAD_BYTES,
+  formatBytes,
+  isAllowedUploadExtension,
+} from "../lib/uploads";
+
+const UPLOAD_ACCEPT = ALLOWED_UPLOAD_EXTENSIONS.map((ext) => `.${ext}`).join(",");
+
+function PaperclipIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        d="M8 12.5 15.5 5a3.2 3.2 0 0 1 4.5 4.5L11.4 18a2 2 0 0 1-2.8-2.8l7-7"
+      />
+    </svg>
+  );
+}
+
+/** Paperclip + attached-file chips for one question. Renders nothing when the
+ *  uploads feature is off or the field carries no questionKey. */
+function AttachRow({ questionKey }: { questionKey: string }) {
+  const uploads = useUploads();
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [busyCount, setBusyCount] = useState(0);
+  const [attachError, setAttachError] = useState("");
+  const [removing, setRemoving] = useState<string | null>(null);
+
+  if (!uploads || !uploads.enabled) return null;
+  const items = uploads.items.filter((item) => item.questionKey === questionKey);
+
+  async function handleFiles(fileList: FileList | null) {
+    if (!fileList || !fileList.length) return;
+    setAttachError("");
+    for (const file of Array.from(fileList)) {
+      if (!isAllowedUploadExtension(file.name)) {
+        setAttachError(`${file.name}: that file type is not supported here.`);
+        continue;
+      }
+      if (file.size > MAX_UPLOAD_BYTES) {
+        setAttachError(`${file.name}: files over ${formatBytes(MAX_UPLOAD_BYTES)} are too large.`);
+        continue;
+      }
+      setBusyCount((n) => n + 1);
+      try {
+        await uploads!.upload(file, questionKey);
+      } catch (err) {
+        setAttachError(
+          err instanceof Error && err.message ? err.message : `${file.name} could not be uploaded.`,
+        );
+      } finally {
+        setBusyCount((n) => Math.max(0, n - 1));
+      }
+    }
+  }
+
+  async function handleRemove(id: string) {
+    setRemoving(id);
+    setAttachError("");
+    try {
+      await uploads!.remove(id);
+    } catch {
+      setAttachError("Could not remove that file. Try again.");
+    } finally {
+      setRemoving(null);
+    }
+  }
+
+  return (
+    <div className="upload-attach">
+      <input
+        ref={inputRef}
+        type="file"
+        className="visually-hidden"
+        accept={UPLOAD_ACCEPT}
+        multiple
+        onChange={(event) => {
+          void handleFiles(event.target.files);
+          event.target.value = "";
+        }}
+      />
+      <button
+        type="button"
+        className="upload-clip"
+        aria-label="Attach a file"
+        disabled={busyCount > 0}
+        onClick={() => inputRef.current?.click()}
+      >
+        <PaperclipIcon />
+      </button>
+      {items.length || busyCount || attachError ? (
+        <div className="upload-chips" aria-live="polite">
+          {items.map((item) => (
+            <span className="upload-chip" key={item.id}>
+              {item.name}
+              <button
+                type="button"
+                aria-label={`Remove ${item.name}`}
+                disabled={removing === item.id}
+                onClick={() => void handleRemove(item.id)}
+              >
+                ×
+              </button>
+            </span>
+          ))}
+          {Array.from({ length: busyCount }).map((_, i) => (
+            <span className="upload-chip busy" key={`busy-${i}`}>
+              Uploading…
+            </span>
+          ))}
+          {attachError ? <span className="upload-chip-error">{attachError}</span> : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
 
 const MIC_SETTINGS_URL =
-  "chrome://settings/content/siteDetails?site=" +
-  encodeURIComponent(window.location.origin);
+  "chrome://settings/content/siteDetails?site=" + encodeURIComponent(window.location.origin);
 
 /** Centered branded ask when the browser blocks the microphone (Danny, 2026-09-18). */
 function MicBlockedModal({
@@ -84,7 +206,12 @@ type SpeechRec = {
   lang: string;
   interimResults: boolean;
   continuous: boolean;
-  onresult: ((event: { resultIndex: number; results: ArrayLike<{ isFinal: boolean; 0: { transcript: string } }> }) => void) | null;
+  onresult:
+    | ((event: {
+        resultIndex: number;
+        results: ArrayLike<{ isFinal: boolean; 0: { transcript: string } }>;
+      }) => void)
+    | null;
   onerror: ((event: { error?: string }) => void) | null;
   onend: (() => void) | null;
   start: () => void;
@@ -102,22 +229,26 @@ function micHint(code: string | undefined): string {
     case "service-not-allowed":
       return "Microphone is blocked for this site. Click the icon in the address bar, allow the mic, then tap Speak again.";
     case "no-speech":
-      return "No speech heard. Tap Speak and talk."
+      return "No speech heard. Tap Speak and talk.";
     case "audio-capture":
-      return "No microphone found. Plug one in or type instead."
+      return "No microphone found. Plug one in or type instead.";
     case "network":
-      return "The speech service is unreachable. Check your connection."
+      return "The speech service is unreachable. Check your connection.";
     case "aborted":
       return "";
     default:
-      return "Voice input failed. Try again or type instead."
+      return "Voice input failed. Try again or type instead.";
   }
 }
 
 function speechEngine(): SpeechRec | null {
   const Speech =
-    (window as Window & { SpeechRecognition?: new () => SpeechRec; webkitSpeechRecognition?: new () => SpeechRec })
-      .SpeechRecognition ||
+    (
+      window as Window & {
+        SpeechRecognition?: new () => SpeechRec;
+        webkitSpeechRecognition?: new () => SpeechRec;
+      }
+    ).SpeechRecognition ||
     (window as Window & { webkitSpeechRecognition?: new () => SpeechRec }).webkitSpeechRecognition;
   if (!Speech) return null;
   const rec = new Speech();
@@ -136,6 +267,7 @@ export function VoiceField({
   multiline = false,
   onEnter,
   serverTranscribe,
+  questionKey,
 }: {
   label: string;
   value: string;
@@ -146,6 +278,9 @@ export function VoiceField({
   onEnter?: () => void;
   /** Server fallback when Web Speech cannot (blob, seconds) -> transcript. */
   serverTranscribe?: (blob: Blob, seconds: number) => Promise<string>;
+  /** Stable id (see lib/uploads.ts toQuestionKey) that lets a founder attach a
+   *  file to this specific question. Omit to leave the paperclip off. */
+  questionKey?: string;
 }) {
   const [listening, setListening] = useState(false);
   const [serverBusy, setServerBusy] = useState(false);
@@ -351,6 +486,7 @@ export function VoiceField({
           </svg>
         </button>
       ) : null}
+      {questionKey ? <AttachRow questionKey={questionKey} /> : null}
       {hint || serverBusy ? (
         <span className="voice-hint" role="status" aria-live="polite">
           {serverBusy ? "Transcribing…" : hint}

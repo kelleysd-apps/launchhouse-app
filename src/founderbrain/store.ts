@@ -30,6 +30,7 @@ import { assertSafeRole } from "./migrations.ts";
 
 const BRAIN_PATH = "brain.json";
 const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+export const PG_STORE_POOL_MAX = 8;
 
 /** Sections summarized per version in /api/history (mission sections of the Brain). */
 const SUMMARY_SECTIONS = ["identity", "customer", "offer", "voice", "context"] as const;
@@ -54,7 +55,6 @@ function brainChangedSections(brain: Brain, previous: Brain | null): SummarySect
     (section) => JSON.stringify(brain[section]) !== JSON.stringify(previous[section]),
   );
 }
-
 
 type FounderRow = {
   version: number | string | bigint;
@@ -144,7 +144,7 @@ export class PgBrainStore {
     if (!databaseUrl) throw new Error("FounderBrain database URL is required");
     this.production = production;
     this.sql = postgres(databaseUrl, {
-      max: 8,
+      max: PG_STORE_POOL_MAX,
       onnotice: () => undefined,
       connection: { application_name: "founderbrain-runtime" },
     });
@@ -502,7 +502,10 @@ export class PgBrainStore {
             track: brain.identity.track,
             hybrid: brain.identity.hybrid,
             approved: SUMMARY_SECTIONS.filter((section) => brain[section].approved),
-            changed: brainChangedSections(brain, index + 1 < brains.length ? brains[index + 1]! : null),
+            changed: brainChangedSections(
+              brain,
+              index + 1 < brains.length ? brains[index + 1]! : null,
+            ),
           };
         });
       });
@@ -599,6 +602,12 @@ export class PgBrainStore {
         const orientationSchema = await tx`select to_regclass('public.fb_orientation') as present`;
         if (orientationSchema[0]?.present) {
           await tx`delete from fb_orientation where founder_id = ${workspaceId}`;
+        }
+        // Uploads reference ge_blob (original and extracted-text bytes); drop them
+        // before the blob wipe below or that delete would fail its foreign key.
+        const uploadSchema = await tx`select to_regclass('public.fb_upload') as present`;
+        if (uploadSchema[0]?.present) {
+          await tx`delete from fb_upload where founder_id = ${workspaceId}`;
         }
         await tx`delete from fb_receipt where founder_id = ${workspaceId}`;
         await tx`delete from ge_file_version where founder_id = ${workspaceId}`;

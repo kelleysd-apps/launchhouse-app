@@ -46,7 +46,9 @@ test("chapter order maps prep homework and skips dropped delivery", () => {
   assert.equal(ghlScreens(false)[3]?.usage, true);
   assert.equal(ghlScreens(false)[4]?.id, "ghl-connect");
   assert.match(contentScreens("b2b")[2]!.title, /Email domain/i);
-  assert.match(contentScreens("b2c")[2]!.title, /Instagram/i);
+  assert.equal(contentScreens("b2c")[2]!.title, "Instagram (optional)");
+  assert.match(contentScreens("b2c")[2]!.body.join(" "), /leave this blank/i);
+  assert.doesNotMatch(contentScreens("b2c")[2]!.body.join(" "), /business account/i);
   assert.match(outreachScreens("b2b")[1]!.title, /Prospect/i);
   assert.match(outreachScreens("b2c")[1]!.title, /Twenty-five/i);
 
@@ -129,6 +131,88 @@ test("atlanta ready map is green only when all artifacts are ready", () => {
   );
   assert.equal(green.green, true);
   assert.equal(green.readyCount, green.total);
+  assert.equal(green.total, 7);
+  assert.equal(green.artifacts.some((artifact) => artifact.key === "trackSetup"), true);
+
+  const missingDomain = atlantaReadyMap(
+    { identity: true, customer: true, offer: true, voice: true, output: true },
+    {
+      ...orientation,
+      contentAnswers: { bottleneck: "time", workflow: "batch-weekly" },
+    },
+  );
+  assert.equal(missingDomain.total, 7);
+  assert.equal(missingDomain.green, false);
+});
+
+function completedB2COrientation(instagramHandle?: string, instagramBusiness?: boolean) {
+  const accounts = Array.from({ length: 25 }, (_, index) => `account-${index + 1}`).join("\n");
+  return applyOrientationPatch(emptyOrientationState(), {
+    firstLoginComplete: true,
+    track: "b2c",
+    contentComplete: true,
+    outreachComplete: true,
+    contentAnswers: {
+      ...(instagramHandle === undefined ? {} : { instagramHandle }),
+      ...(instagramBusiness === undefined ? {} : { instagramBusiness }),
+      bottleneck: "time",
+      workflow: "batch-weekly",
+    },
+    outreachAnswers: {
+      copy: "A real outreach note that is long enough to send on Saturday to a named account.",
+      accounts,
+    },
+    ghlComplete: true,
+    ghlAnswers: { hasAccount: true, connected: true },
+  });
+}
+
+const completeReadiness = {
+  identity: true,
+  customer: true,
+  offer: true,
+  voice: true,
+  output: true,
+};
+
+test("B2C readiness has six real requirements and Instagram stays optional", () => {
+  for (const orientation of [
+    completedB2COrientation(),
+    completedB2COrientation("   "),
+    completedB2COrientation("geauxride"),
+    completedB2COrientation(undefined, true),
+  ]) {
+    const ready = atlantaReadyMap(completeReadiness, orientation);
+    assert.equal(ready.green, true);
+    assert.equal(ready.readyCount, 6);
+    assert.equal(ready.total, 6);
+    assert.equal(ready.artifacts.some((artifact) => artifact.key === "trackSetup"), false);
+  }
+});
+
+test("B2C readiness still blocks missing work and an unknown track", () => {
+  const complete = completedB2COrientation();
+
+  assert.equal(
+    atlantaReadyMap(completeReadiness, { ...complete, contentCompletedAt: null }).green,
+    false,
+  );
+  assert.equal(
+    atlantaReadyMap(completeReadiness, { ...complete, outreachCompletedAt: null }).green,
+    false,
+  );
+  assert.equal(
+    atlantaReadyMap({ ...completeReadiness, output: false }, complete).green,
+    false,
+  );
+
+  const unknownTrack = atlantaReadyMap(completeReadiness, { ...complete, track: null });
+  assert.equal(unknownTrack.green, false);
+  assert.equal(unknownTrack.total, 7);
+  assert.equal(
+    unknownTrack.artifacts.some((artifact) => /instagram/i.test(artifact.label)),
+    false,
+  );
 });
 
 test("a checkbox cannot finish Saturday content or outreach", () => {
@@ -162,14 +246,10 @@ test("a checkbox cannot finish Saturday content or outreach", () => {
   assert.equal(contentPackBlock(pieces, Array.from({ length: 30 }, (_, index) => index + 1)), null);
 });
 
-// Regression for a build break where orientation.ts imports trackSetupReady
-// from saturday-work.ts, but the export had been dropped. This locks the
-// restored semantics in place: b2b mirrors the same email-domain check
-// contentFieldBlock uses, independent of chapter completion. b2c is stricter
-// than contentFieldBlock on purpose — a blank handle can finish the Saturday
-// content chapter, but the separate Sunday "Instagram is a business account"
-// item stays unfinished until an actual valid handle is saved.
-test("trackSetupReady mirrors the track's field validity, not chapter completion", () => {
+// B2B setup mirrors the content chapter's email-domain check. B2C has no
+// separate setup requirement because Instagram is optional. Unknown track
+// remains blocked.
+test("trackSetupReady keeps B2B domain checks and has no B2C requirement", () => {
   assert.equal(trackSetupReady({ track: null, contentAnswers: {}, outreachAnswers: {} }), false);
 
   assert.equal(
@@ -193,19 +273,17 @@ test("trackSetupReady mirrors the track's field validity, not chapter completion
     true,
   );
 
-  // A blank handle finishes the content chapter (contentFieldBlock treats it
-  // as optional) but does NOT satisfy the Sunday track-setup item.
   assert.equal(
     trackSetupReady({ track: "b2c", contentAnswers: {}, outreachAnswers: {} }),
-    false,
+    true,
   );
   assert.equal(
     trackSetupReady({
       track: "b2c",
-      contentAnswers: { instagramHandle: "not a handle" },
+      contentAnswers: { instagramHandle: "   " },
       outreachAnswers: {},
     }),
-    false,
+    true,
   );
   assert.equal(
     trackSetupReady({

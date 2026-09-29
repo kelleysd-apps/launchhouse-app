@@ -400,6 +400,163 @@ class BrowserAuthTests(unittest.TestCase):
         expect(connect_button).to_be_focused()
         self.assertEqual(self.errors, [])
 
+    def _open_ghl_fixture(self, *, name="Demo Clinic", remote=None):
+        """All provider traffic is intercepted. No real founder or CRM is used."""
+        brain = self._complete_brain()
+        brain["identity"]["track"] = "b2c"
+        orientation = self._complete_orientation()
+        orientation.update({"track": "b2c", "ghlScreen": 5,
+                            "ghlCompletedAt": "2026-09-27T00:00:00.000Z",
+                            "ghlAnswers": {"hasAccount": True, "connected": True}})
+        state = {
+            "connection": {"connected": True, "locationId": "demo-location",
+                           "locationName": name, "connectionId": "fixture-connection-1",
+                           "nameUnavailable": name is None},
+            "link": {"key": "dm_booking_link", "name": "DM Booking Link", "value": remote},
+            "writes": [], "disconnects": [], "starts": 0,
+            "failStatus": False, "failLink": False, "proven": True,
+        }
+        self.context.route(self.origin + "/api/**", lambda r: r.fulfill(status=404, json={"message": "Unknown fixture endpoint"}))
+        self.context.route(self.origin + "/api/config", lambda r: r.fulfill(json={
+            "authMode": "hexclave", "hexclave": {"projectId": PROJECT, "apiUrl": AUTH_ORIGIN,
+            "publishableClientKey": None}, "aiEnabled": True, "crmConnectEnabled": True,
+        }))
+        self.context.route(self.origin + "/api/me", lambda r: r.fulfill(json={"email": "ada@example.test"}))
+        self.context.route(self.origin + "/api/brain", lambda r: r.fulfill(json={
+            "workspaceId": "ws_fixture", "version": 3, "sha": "0" * 64,
+            "updatedAt": "2026-09-27T00:00:00.000Z", "brain": brain,
+            "readiness": dict.fromkeys(["identity", "customer", "offer", "voice", "context", "output"], True),
+            "verified": True, "artifact": None,
+        }))
+        # Model the completed setup without the unrelated fixed V2-upgrade banner.
+        self.context.route(self.origin + "/api/artifact", lambda r: r.fulfill(json={
+            "artifact": {"id": "ghl-fixture-pack", "sourceVersion": 3,
+                         "text": "## Content\nSynthetic fixture.\n## Outreach\nSynthetic fixture.\n90 day plan\nSynthetic fixture.",
+                         "acceptedAt": "2026-09-27T00:00:00.000Z"},
+            "stale": False,
+        }))
+        self.context.route(self.origin + "/api/orientation", lambda r: r.fulfill(json=orientation))
+        self.context.route(self.origin + "/api/history", lambda r: r.fulfill(json={"versions": []}))
+        self.context.route(self.origin + "/api/usage", lambda r: r.fulfill(json={
+            "ai": {"events": 0, "inputTokens": 0, "outputTokens": 0, "priceMicroUsd": 0},
+            "firecrawl": {"scrapes": 0, "credits": 0, "priceMicroUsd": 0}, "totalMicroUsd": 0,
+        }))
+        def status(route):
+            if state["failStatus"]:
+                route.fulfill(status=503, json={"message": "Status fixture unavailable"})
+            else:
+                route.fulfill(json=state["connection"])
+        def links(route):
+            if route.request.method == "GET":
+                route.fulfill(json={"connection": state["connection"], "links": [state["link"]]})
+                return
+            body = route.request.post_data_json
+            state["writes"].append(body)
+            if state["failLink"]:
+                route.fulfill(status=422, json={"message": "Provider fixture refused the link"})
+                return
+            state["link"]["value"] = body["url"]
+            route.fulfill(json={"connection": state["connection"], "link": state["link"],
+                                "written": True, "proven": state["proven"]})
+        def disconnect(route):
+            state["disconnects"].append(route.request.post_data_json)
+            state["connection"] = {"connected": False, "locationId": None,
+                                   "locationName": None, "connectionId": None}
+            orientation["ghlAnswers"]["connected"] = False
+            orientation["ghlCompletedAt"] = None
+            route.fulfill(json={**state["connection"], "orientation": orientation})
+        def start(route):
+            state["starts"] += 1
+            route.fulfill(json={"url": self.origin + "/ghl-fixture-picker"})
+        self.context.route(self.origin + "/api/oauth/status", status)
+        self.context.route(self.origin + "/api/ghl/booking-links*", links)
+        self.context.route(self.origin + "/api/oauth/connection", disconnect)
+        self.context.route(self.origin + "/api/oauth/start", start)
+        self.context.route(self.origin + "/ghl-fixture-picker", lambda r: r.fulfill(content_type="text/html", body="<h1>Fixture account picker</h1>"))
+        self.set_session()
+        self.page.goto(self.origin)
+        self.page.get_by_role("button", name="Review GoHighLevel", exact=True).click()
+        panel = self.page.get_by_role("region", name="Connected GoHighLevel subaccount", exact=True)
+        expect(panel).to_be_visible()
+        expect(panel.get_by_role("textbox", name="DM Booking Link HTTPS URL", exact=True)).to_be_visible()
+        return state, panel
+
+    def test_ghl_named_destination_transfer_replace_disconnect_and_reconnect(self):
+        state, panel = self._open_ghl_fixture()
+        expect(panel.get_by_role("heading", name="Demo Clinic", exact=True)).to_be_visible()
+        expect(panel).to_contain_text("demo-location")
+        field = panel.get_by_role("textbox", name="DM Booking Link HTTPS URL", exact=True)
+        transfer = panel.get_by_role("button", name="Transfer DM Booking Link to Demo Clinic", exact=True)
+        field.fill("javascript:alert(1)")
+        transfer.click()
+        expect(panel).to_contain_text("Enter the actual HTTPS booking URL")
+        self.assertEqual(state["writes"], [])
+        field.fill("https://book.example.test/first")
+        transfer.click()
+        expect(panel).to_contain_text("Written and verified in Demo Clinic")
+        self.assertEqual(state["writes"][-1]["connectionId"], "fixture-connection-1")
+        field.fill("https://book.example.test/second")
+        transfer.click()
+        expect(panel.get_by_role("group", name="Replace DM Booking Link")).to_be_visible()
+        self.assertEqual(len(state["writes"]), 1)
+        panel.get_by_role("button", name="Confirm replacement", exact=True).click()
+        expect(panel.get_by_role("link", name="https://book.example.test/second", exact=True)).to_be_visible()
+        self.assertEqual(state["writes"][-1]["expectedValue"], "https://book.example.test/first")
+        self.assertIs(state["writes"][-1]["replaceExisting"], True)
+        panel.get_by_role("button", name="Disconnect", exact=True).click()
+        expect(panel).to_contain_text("It does not delete content or workflows")
+        self.assertEqual(state["disconnects"], [])
+        panel.get_by_role("button", name="Disconnect Demo Clinic", exact=True).click()
+        expect(self.page.get_by_role("heading", name="No subaccount connected", exact=True)).to_be_visible()
+        expect(self.page.get_by_text("Written and verified in Demo Clinic", exact=True)).to_have_count(0)
+        self.assertEqual(state["disconnects"], [{"connectionId": "fixture-connection-1", "confirmed": True}])
+        self.page.get_by_role("button", name="Connect another subaccount", exact=True).click()
+        expect(self.page.get_by_role("heading", name="Fixture account picker", exact=True)).to_be_visible()
+        self.assertEqual(state["starts"], 1)
+        self.assertEqual(self.errors, [])
+
+    def test_ghl_failed_transfer_retains_input_and_unverified_is_not_success(self):
+        state, panel = self._open_ghl_fixture()
+        field = panel.get_by_role("textbox", name="DM Booking Link HTTPS URL", exact=True)
+        transfer = panel.get_by_role("button", name="Transfer DM Booking Link to Demo Clinic", exact=True)
+        state["failLink"] = True
+        field.fill("https://book.example.test/retry")
+        transfer.click()
+        expect(panel).to_contain_text("Your typed URL is still here")
+        expect(field).to_have_value("https://book.example.test/retry")
+        state["failLink"] = False
+        state["proven"] = False
+        transfer.click()
+        expect(panel).to_contain_text("GoHighLevel did not verify the exact URL")
+        expect(panel.get_by_text("Written and verified in Demo Clinic", exact=True)).to_have_count(0)
+        self.assertEqual(self.errors, [])
+
+    def test_ghl_status_failure_keeps_name_but_blocks_writes(self):
+        state, panel = self._open_ghl_fixture()
+        state["failStatus"] = True
+        panel.get_by_role("button", name="Refresh status", exact=True).click()
+        expect(panel).to_contain_text("could not verify")
+        expect(panel.get_by_role("heading", name="Demo Clinic", exact=True)).to_be_visible()
+        expect(panel.get_by_role("button", name="Disconnect", exact=True)).to_be_disabled()
+        expect(panel.get_by_role("button", name="Transfer DM Booking Link to Demo Clinic", exact=True)).to_be_disabled()
+        expect(self.page.get_by_role("heading", name="No subaccount connected", exact=True)).to_have_count(0)
+        state["failStatus"] = False
+        panel.get_by_role("button", name="Refresh status", exact=True).click()
+        expect(panel.get_by_role("button", name="Disconnect", exact=True)).to_be_enabled()
+        self.assertEqual(self.errors, [])
+
+    def test_ghl_name_fallback_remains_disconnectable_on_mobile(self):
+        self.page.set_viewport_size({"width": 390, "height": 844})
+        state, panel = self._open_ghl_fixture(name=None)
+        expect(panel.get_by_role("heading", name="Subaccount name unavailable", exact=True)).to_be_visible()
+        expect(panel).to_contain_text("demo-location")
+        expect(panel.get_by_role("button", name="Disconnect", exact=True)).to_be_enabled()
+        box = panel.bounding_box()
+        self.assertGreaterEqual(box["x"], 0)
+        self.assertLessEqual(box["x"] + box["width"], 390)
+        self.assertEqual(state["writes"], [])
+        self.assertEqual(self.errors, [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

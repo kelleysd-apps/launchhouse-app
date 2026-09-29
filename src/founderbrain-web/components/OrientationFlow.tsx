@@ -15,6 +15,7 @@ import {
 } from "../guide-intake";
 import { guideSequence, resolveInitialCursor } from "../lib/intake-navigation";
 import { guideIndexItems } from "../lib/intake-index";
+import { toQuestionKey } from "../lib/uploads";
 
 const NAME_KEY_BASE = "founderbrain.what-to-call-you";
 const YES_KEY_BASE = "founderbrain.welcome-yes";
@@ -465,6 +466,7 @@ export function OrientationFlow({
             setLocalError("");
           }}
           onEnter={() => void continueWithName()}
+          questionKey={toQuestionKey("identity", "name")}
         />
         {(error || localError) && (
           <p className="entry-error" role="alert">
@@ -630,6 +632,7 @@ export function OrientationFlow({
               else setSiteUrl(`https://${value.replace(/^\/+/, "")}`);
             }}
             onEnter={() => void scrapeSite()}
+            questionKey={toQuestionKey("identity", "siteurl")}
           />
         )}
         {!siteImportEnabled && !busy ? (
@@ -742,6 +745,7 @@ export function OrientationFlow({
         serverTranscribe={onTranscribe}
         onChange={setDraft}
         onEnter={step.kind === "long" ? undefined : () => void commitStep(step, draft)}
+        questionKey={step.section === "track" ? undefined : toQuestionKey(step.section, step.field)}
       />
       {(error || localError) && (
         <p className="entry-error" role="alert">

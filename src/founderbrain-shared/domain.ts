@@ -71,7 +71,7 @@ export const brainSchema = z
         ...section,
       })
       .strict(),
-        voice: z
+    voice: z
       .object({
         tone: text,
         boundaries: text,
@@ -127,6 +127,11 @@ export interface Artifact {
   sourceVersion: number;
   sourceHash: string;
   inputHash: string;
+  /** sha256 over the uploaded documents this artifact was generated with (ids, their
+   *  text sha, and allocation status), or null/absent for an artifact generated
+   *  before uploads existed — treated as the empty-corpus hash when compared for
+   *  staleness. Optional so existing artifact-shaped fixtures stay valid. */
+  uploadsHash?: string | null;
   acceptedAt: string | null;
   createdAt: string;
 }

@@ -15,6 +15,8 @@ import type {
   Job,
   Me,
   MediaItem,
+  UploadItem,
+  UploadsAi,
   UsageResponse,
 } from "./types";
 
@@ -30,6 +32,17 @@ export type RoutineDraftRow = {
   createdAt: string;
 };
 import type { OrientationPatch, OrientationState } from "../founderbrain-shared/orientation";
+import type {
+  GhlBookingLinkInput,
+  GhlBookingLinkResult,
+  GhlBookingLinks,
+  GhlConnectionStatus,
+  GhlPushResult,
+} from "../founderbrain-shared/ghl";
+
+export type GhlConnectionMutationResult = GhlConnectionStatus & {
+  orientation: OrientationState;
+};
 
 export class ApiError extends Error {
   constructor(
@@ -75,7 +88,9 @@ export class FounderBrainApi {
   private async headers(init: RequestInit): Promise<Headers> {
     const headers = new Headers(init.headers);
     headers.set("Accept", "application/json");
-    if (init.body) headers.set("Content-Type", "application/json");
+    // A caller that already set Content-Type (raw-body upload: application/octet-stream)
+    // knows better than this default; never clobber it.
+    if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
     if (this.demo) headers.set("X-Dev-User", "demo");
     else if (this.token) {
       const value = await this.token();
@@ -111,8 +126,7 @@ export class FounderBrainApi {
     }
   }
 
-  private async request<T>(path: string, init: RequestInit = {}, timeout = 12_000): Promise<T> {
-    const response = await this.fetchApi(path, init, timeout);
+  private async parseBody<T>(response: Response): Promise<T> {
     const body = (await response.json().catch(() => ({}))) as {
       error?: string;
       message?: string;
@@ -129,6 +143,11 @@ export class FounderBrainApi {
       throw new ApiError(response.status, code, message, body);
     }
     return body as T;
+  }
+
+  private async request<T>(path: string, init: RequestInit = {}, timeout = 12_000): Promise<T> {
+    const response = await this.fetchApi(path, init, timeout);
+    return this.parseBody<T>(response);
   }
 
   gmailStatus() {
@@ -229,7 +248,7 @@ export class FounderBrainApi {
     });
   }
   oauthStatus() {
-    return this.request<{ connected: boolean; locationId: string | null }>("/oauth/status");
+    return this.request<GhlConnectionStatus>("/oauth/status");
   }
   usage() {
     return this.request<UsageResponse>("/usage");
@@ -293,15 +312,26 @@ export class FounderBrainApi {
   deleteVoiceSample(id: string) {
     return this.request<{ count: number }>(`/voice-samples/${id}`, { method: "DELETE" }, 15_000);
   }
-  ghlPush(pack?: string) {
-    return this.request<{
-      snapshot: string;
-      firstPack: string;
-      pushed: string[];
-      skipped: string[];
-      proven: boolean;
-      clinicPaste: string[];
-    }>("/ghl/push", { method: "POST", body: JSON.stringify(pack ? { pack } : {}) }, 60_000);
+  ghlBookingLinks(connectionId: string) {
+    return this.request<GhlBookingLinks>(
+      `/ghl/booking-links?connectionId=${encodeURIComponent(connectionId)}`,
+    );
+  }
+  saveGhlBookingLink(input: GhlBookingLinkInput) {
+    return this.request<GhlBookingLinkResult>("/ghl/booking-links", {
+      method: "PUT",
+      body: JSON.stringify(input),
+    });
+  }
+  ghlPush(connectionId: string, pack?: string) {
+    return this.request<GhlPushResult>(
+      "/ghl/push",
+      {
+        method: "POST",
+        body: JSON.stringify(pack ? { connectionId, pack } : { connectionId }),
+      },
+      60_000,
+    );
   }
   transcribeVoice(audio: { audioBase64: string; mime: string; seconds: number }) {
     return this.request<{ text: string }>(
@@ -310,16 +340,26 @@ export class FounderBrainApi {
       45_000,
     );
   }
-  completeOauth(body: { code: string; state: string }) {
-    return this.request<{
-      connected: boolean;
-      locationId: string | null;
-      orientation?: OrientationState;
-    }>(
+  completeOauth(
+    body:
+      | { code: string; state: string; error?: never }
+      | { error: string; state: string; code?: never },
+  ) {
+    return this.request<GhlConnectionMutationResult>(
       "/oauth/complete",
       {
         method: "POST",
         body: JSON.stringify(body),
+      },
+      30_000,
+    );
+  }
+  disconnectOauth(connectionId: string) {
+    return this.request<GhlConnectionMutationResult>(
+      "/oauth/connection",
+      {
+        method: "DELETE",
+        body: JSON.stringify({ connectionId, confirmed: true }),
       },
       30_000,
     );
@@ -447,15 +487,52 @@ export class FounderBrainApi {
       body: JSON.stringify({ confirmation: "DELETE" }),
     });
   }
-  async download(format: "json" | "markdown"): Promise<void> {
+  async exportBlob(format: "json" | "markdown"): Promise<Blob> {
     const response = await this.fetchApi(`/export?format=${format}`, {}, 20_000);
     if (response.status === 401) throw SESSION_EXPIRED;
     if (!response.ok)
       throw new ApiError(response.status, "export_failed", "Export could not be prepared.");
-    const url = URL.createObjectURL(await response.blob());
+    return response.blob();
+  }
+  async download(format: "json" | "markdown"): Promise<void> {
+    const blob = await this.exportBlob(format);
+    const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
     link.download = `founder-brain.${format === "markdown" ? "md" : "json"}`;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+  /** Raw-body upload. filename and questionKey travel as query params; the body is the file itself. */
+  async uploadFile(file: File, questionKey?: string): Promise<{ item: UploadItem }> {
+    const params = new URLSearchParams({ filename: file.name });
+    if (questionKey) params.set("questionKey", questionKey);
+    const response = await this.fetchApi(
+      `/uploads?${params.toString()}`,
+      { method: "POST", body: file, headers: { "Content-Type": "application/octet-stream" } },
+      60_000,
+    );
+    return this.parseBody<{ item: UploadItem }>(response);
+  }
+  listUploads() {
+    return this.request<{ items: UploadItem[]; ai: UploadsAi }>("/uploads");
+  }
+  deleteUpload(id: string) {
+    return this.request<{ ok: true }>(`/uploads/${encodeURIComponent(id)}`, { method: "DELETE" });
+  }
+  async downloadUploadBlob(id: string): Promise<Blob> {
+    const response = await this.fetchApi(`/uploads/${encodeURIComponent(id)}/download`, {}, 30_000);
+    if (response.status === 401) throw SESSION_EXPIRED;
+    if (!response.ok)
+      throw new ApiError(response.status, "download_failed", "Download could not be prepared.");
+    return response.blob();
+  }
+  async downloadUpload(id: string, filename: string): Promise<void> {
+    const blob = await this.downloadUploadBlob(id);
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
     link.click();
     URL.revokeObjectURL(url);
   }

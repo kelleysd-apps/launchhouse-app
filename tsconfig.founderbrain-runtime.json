@@ -12,12 +12,9 @@
     "src/founderbrain/main.ts",
     "src/founderbrain/worker.ts",
     "src/founderbrain/migrate-main.ts",
-    "src/founderbrain/reconcile-main.ts"
+    "src/founderbrain/reconcile-main.ts",
+    "src/founderbrain/extract-worker.ts",
+    "src/server/uploads/mammoth.d.ts"
   ],
-  "exclude": [
-    "node_modules",
-    "dist",
-    "vendor",
-    "**/*.test.ts"
-  ]
+  "exclude": ["node_modules", "dist", "vendor", "**/*.test.ts"]
 }

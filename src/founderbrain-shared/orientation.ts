@@ -198,7 +198,6 @@ export function atlantaReadyMap(
   orientation: OrientationState,
 ): AtlantaReadyMap {
   const brainThesis = readiness.identity && readiness.customer && readiness.offer;
-  const trackSetup = trackSetupReady(orientation);
   const artifacts: AtlantaArtifact[] = [
     {
       key: "brainThesis",
@@ -230,24 +229,24 @@ export function atlantaReadyMap(
       day: "saturday",
       ready: orientation.outreachCompletedAt !== null && outreachFieldBlock(orientation) === null,
     },
-    {
+  ];
+  if (orientation.track !== "b2c") {
+    artifacts.push({
       key: "trackSetup",
       label:
-        orientation.track === "b2c"
-          ? "Your Instagram is a business account"
-          : orientation.track === "b2b"
-            ? "Your email domain is set up and ready to send"
-            : "Your email domain or Instagram business account is set up",
+        orientation.track === "b2b"
+          ? "Your email domain is set up and ready to send"
+          : "Choose B2B or B2C to see your track setup requirement",
       day: "sunday",
-      ready: trackSetup,
-    },
-    {
-      key: "ghlAccount",
-      label: "Your GoHighLevel account is connected",
-      day: "sunday",
-      ready: orientation.ghlAnswers.connected === true,
-    },
-  ];
+      ready: trackSetupReady(orientation),
+    });
+  }
+  artifacts.push({
+    key: "ghlAccount",
+    label: "Your GoHighLevel account is connected",
+    day: "sunday",
+    ready: orientation.ghlAnswers.connected === true,
+  });
   const readyCount = artifacts.filter((a) => a.ready).length;
   return {
     artifacts,

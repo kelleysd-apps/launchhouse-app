@@ -3,6 +3,7 @@
  * onto the Brain schema. Skip a step when that field is already filled.
  */
 import type { Brain } from "./types";
+import { toQuestionKey } from "./lib/uploads";
 
 export type GuideKind = "text" | "long" | "choices";
 export type GuideSection = "identity" | "customer" | "offer" | "voice" | "track";
@@ -216,3 +217,10 @@ export function nextGuideStep(brain: Brain, track: string | null): GuideStep | n
 export function guideIsComplete(brain: Brain, track: string | null): boolean {
   return GUIDE_STEPS.filter((step) => !step.optional).every((step) => !step.empty(brain, track));
 }
+
+/** questionKey -> founder-facing question title, for the Files screen. Covers
+ *  the first-run guide steps; a mission-only field falls back to
+ *  humanizeQuestionKey (lib/uploads.ts) since it has no GUIDE_STEP entry. */
+export const questionKeyTitles: Record<string, string> = Object.fromEntries(
+  GUIDE_STEPS.map((step) => [toQuestionKey(step.section, step.field), step.title]),
+);

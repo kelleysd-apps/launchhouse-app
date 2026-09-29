@@ -4,6 +4,14 @@
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ApiError, FounderBrainApi } from "./api";
+import type {
+  GhlBookingLinkInput,
+  GhlBookingLinkKey,
+  GhlBookingLinkResult,
+  GhlBookingLinks,
+  GhlConnectionStatus,
+  GhlPushResult,
+} from "../founderbrain-shared/ghl";
 import { createHexclave, type HexclaveSession } from "./hexclave";
 import {
   emptyBrain,
@@ -17,8 +25,13 @@ import {
   type MissionSection,
   type RoutineDraft,
   type RoutineSettings,
+  type UploadItem,
+  type UploadsAi,
   type UsageResponse,
 } from "./types";
+import { MAX_DOWNLOAD_ALL_BYTES, dedupeFilename, formatBytes } from "./lib/uploads";
+import { isPack, splitPack } from "./pack";
+import { zipSync, strToU8 } from "fflate";
 import {
   PENDING_JOB_STORAGE_KEY,
   nextSaveOperation,
@@ -26,6 +39,11 @@ import {
   settleSaveDecision,
 } from "./lib/brain-draft";
 import { prepareGenerateJob, runExclusive, type LockRef } from "./lib/generate-job";
+import {
+  captureGhlAsyncGuard,
+  isGhlAsyncGuardCurrent,
+  type GhlAsyncEpochs,
+} from "./lib/ghl-async-guard";
 import {
   JOB_POLL_DEADLINE_MS,
   JOB_POLL_INITIAL_WAIT_MS,
@@ -40,7 +58,6 @@ import { type View } from "./components/MissionRail";
 import {
   emptyOrientationState,
   isFirstLoginComplete,
-  GHL_CHAPTER_SCREENS,
   type OrientationPatch,
   type OrientationState,
 } from "../founderbrain-shared/orientation";
@@ -60,7 +77,19 @@ export function useFounderBrainApp() {
   const [orientation, setOrientation] = useState<OrientationState | null>(null);
   const [orientationSaving, setOrientationSaving] = useState(false);
   const [connecting, setConnecting] = useState(false);
-  const [view, setView] = useState<View>(() => window.location.pathname === "/gmail/callback" ? "gmail" : "atlanta");
+  const [disconnecting, setDisconnecting] = useState(false);
+  const [ghlConnection, setGhlConnection] = useState<GhlConnectionStatus | null>(null);
+  const [ghlStatusVerified, setGhlStatusVerified] = useState(false);
+  const [ghlStatusLoading, setGhlStatusLoading] = useState(false);
+  const [ghlStatusError, setGhlStatusError] = useState("");
+  const [ghlConnectionGeneration, setGhlConnectionGeneration] = useState(0);
+  const [ghlBookingLinks, setGhlBookingLinks] = useState<GhlBookingLinks | null>(null);
+  const [ghlBookingLoading, setGhlBookingLoading] = useState(false);
+  const [ghlBookingError, setGhlBookingError] = useState("");
+  const [ghlLinkSavingKey, setGhlLinkSavingKey] = useState<GhlBookingLinkKey | null>(null);
+  const [view, setView] = useState<View>(() =>
+    window.location.pathname === "/gmail/callback" ? "gmail" : "atlanta",
+  );
   const [mission, setMission] = useState<Mission>("identity");
   const [changed, setChanged] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -70,6 +99,9 @@ export function useFounderBrainApp() {
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [usage, setUsage] = useState<UsageResponse | null>(null);
   const [routineDrafts, setRoutineDrafts] = useState<RoutineDraft[]>([]);
+  const [uploads, setUploads] = useState<UploadItem[]>([]);
+  const [uploadsAi, setUploadsAi] = useState<UploadsAi>({ budgetBytes: 0, usedBytes: 0 });
+  const uploadsLoaded = useRef(false);
   // Settings are written by the routines toggle flow; the value is not rendered
   // anywhere while the feature stays draft-only (ROUTINES_ENABLED off).
   const [, setRoutineSettings] = useState<RoutineSettings | null>(null);
@@ -87,7 +119,18 @@ export function useFounderBrainApp() {
   const [deleteText, setDeleteText] = useState("");
   const latestDraft = useRef(draft);
   const sessionEpoch = useRef(0);
+  const workspaceEpoch = useRef(0);
+  const workspaceIdentity = useRef<string | null>(null);
+  const connectionGeneration = useRef(0);
+  const ghlConnectionRef = useRef<GhlConnectionStatus | null>(null);
+  const ghlStatusVerifiedRef = useRef(false);
   const oauthHandled = useRef(false);
+  const statusOperation = useRef<symbol | null>(null);
+  const connectOperation = useRef<symbol | null>(null);
+  const disconnectOperation = useRef<symbol | null>(null);
+  const pushOperation = useRef<symbol | null>(null);
+  const bookingLoadOperation = useRef<symbol | null>(null);
+  const bookingWriteOperation = useRef<symbol | null>(null);
   // Bumped around Connect writes so an in-flight workspace GET cannot put the
   // old "not connected" orientation back on screen after OAuth succeeds.
   const orientationEpoch = useRef(0);
@@ -118,8 +161,69 @@ export function useFounderBrainApp() {
       : "Something went wrong. Your draft has not been discarded.";
   };
   const jobStorage = PENDING_JOB_STORAGE_KEY;
+  const currentGhlEpochs = (): GhlAsyncEpochs => ({
+    session: sessionEpoch.current,
+    workspace: workspaceEpoch.current,
+    connection: connectionGeneration.current,
+  });
+  const captureGhlGuard = () => captureGhlAsyncGuard(currentGhlEpochs());
+  const ghlGuardCurrent = (
+    guard: GhlAsyncEpochs,
+    scope: "workspace" | "connection" = "connection",
+  ) => isGhlAsyncGuardCurrent(guard, currentGhlEpochs(), scope);
+  const resetGhlLinks = () => {
+    setGhlBookingLinks(null);
+    setGhlBookingLoading(false);
+    setGhlBookingError("");
+    setGhlLinkSavingKey(null);
+  };
+  const bumpConnectionGeneration = () => {
+    connectionGeneration.current += 1;
+    setGhlConnectionGeneration(connectionGeneration.current);
+    resetGhlLinks();
+  };
+  const connectionIdentity = (status: GhlConnectionStatus | null) =>
+    status?.connected ? `${status.connectionId ?? ""}:${status.locationId ?? ""}` : "disconnected";
+  const applyGhlConnection = (status: GhlConnectionStatus, guard: GhlAsyncEpochs): boolean => {
+    if (!ghlGuardCurrent(guard)) return false;
+    if (connectionIdentity(ghlConnectionRef.current) !== connectionIdentity(status)) {
+      bumpConnectionGeneration();
+      pushOperation.current = null;
+      bookingLoadOperation.current = null;
+      bookingWriteOperation.current = null;
+    }
+    ghlConnectionRef.current = status;
+    ghlStatusVerifiedRef.current = true;
+    setGhlConnection(status);
+    setGhlStatusVerified(true);
+    setGhlStatusError("");
+    return true;
+  };
+  const invalidateGhlIdentity = () => {
+    bumpConnectionGeneration();
+    pushOperation.current = null;
+    bookingLoadOperation.current = null;
+    bookingWriteOperation.current = null;
+    ghlStatusVerifiedRef.current = false;
+    setGhlStatusVerified(false);
+    setGhlStatusError(
+      "The GoHighLevel connection changed during that request. Refresh status before writing again.",
+    );
+  };
   const clearPrivate = () => {
     sessionEpoch.current += 1;
+    workspaceEpoch.current += 1;
+    workspaceIdentity.current = null;
+    connectionGeneration.current += 1;
+    setGhlConnectionGeneration(connectionGeneration.current);
+    ghlConnectionRef.current = null;
+    ghlStatusVerifiedRef.current = false;
+    statusOperation.current = null;
+    connectOperation.current = null;
+    disconnectOperation.current = null;
+    pushOperation.current = null;
+    bookingLoadOperation.current = null;
+    bookingWriteOperation.current = null;
     saveOperation.current = null;
     jobOperation.current = null;
     acceptOperation.current = null;
@@ -127,6 +231,13 @@ export function useFounderBrainApp() {
     setState(null);
     setOrientation(null);
     setOrientationSaving(false);
+    setConnecting(false);
+    setDisconnecting(false);
+    setGhlConnection(null);
+    setGhlStatusVerified(false);
+    setGhlStatusLoading(false);
+    setGhlStatusError("");
+    resetGhlLinks();
     latestDraft.current = emptyBrain();
     setDraft(latestDraft.current);
     setChanged(false);
@@ -142,6 +253,9 @@ export function useFounderBrainApp() {
     setJobNeedsReconcile(false);
     setDeleteOpen(false);
     setDeleteText("");
+    setUploads([]);
+    setUploadsAi({ budgetBytes: 0, usedBytes: 0 });
+    uploadsLoaded.current = false;
   };
 
   useEffect(() => {
@@ -181,6 +295,16 @@ export function useFounderBrainApp() {
       try {
         const me = await api.me();
         if (epoch !== sessionEpoch.current) return;
+        if (workspaceIdentity.current !== me.email) {
+          workspaceIdentity.current = me.email;
+          workspaceEpoch.current += 1;
+          bumpConnectionGeneration();
+          ghlConnectionRef.current = null;
+          ghlStatusVerifiedRef.current = false;
+          setGhlConnection(null);
+          setGhlStatusVerified(false);
+          setGhlStatusError("");
+        }
         setEmail(me.email);
         setSessionExpired(false);
       } catch (err) {
@@ -191,6 +315,7 @@ export function useFounderBrainApp() {
   useEffect(() => {
     if (api && email) void loadWorkspace();
     if (api && email && config?.routinesEnabled) void loadRoutines();
+    if (api && email && config?.uploadsEnabled) void loadUploads();
   }, [api, email]);
   // Tokens used (Danny, 2026-09-21): keep the account chip's spend line fresh
   // wherever AI can run (missions run generation, chapters run site reads).
@@ -224,6 +349,7 @@ export function useFounderBrainApp() {
   async function loadWorkspace() {
     if (!api) return;
     const epoch = sessionEpoch.current;
+    const workspace = workspaceEpoch.current;
     const epochOrientation = orientationEpoch.current;
     setError("");
     try {
@@ -235,7 +361,7 @@ export function useFounderBrainApp() {
         if (!(err instanceof ApiError && (err.status === 404 || err.status === 503))) throw err;
         nextOrientation = emptyOrientationState();
       }
-      if (epoch !== sessionEpoch.current) return;
+      if (epoch !== sessionEpoch.current || workspace !== workspaceEpoch.current) return;
       setState(nextState);
       if (orientationEpoch.current === epochOrientation) setOrientation(nextOrientation);
       latestDraft.current = nextState.brain;
@@ -248,7 +374,8 @@ export function useFounderBrainApp() {
       if (pendingJob) void pollJob(pendingJob, epoch);
       if (nextOrientation.ghlAnswers.connected !== true) void healGhlConnection();
     } catch (err) {
-      if (epoch === sessionEpoch.current) setError(friendlyError(err));
+      if (epoch === sessionEpoch.current && workspace === workspaceEpoch.current)
+        setError(friendlyError(err));
     }
   }
 
@@ -275,22 +402,50 @@ export function useFounderBrainApp() {
     }
   }
 
-  /** CRM row exists but the chapter flag does not. Heal it instead of sending them through OAuth again. */
-  async function healGhlConnection() {
-    if (!api) return;
+  async function refreshGhlStatus(options: { announce?: boolean } = {}) {
+    if (!api || statusOperation.current) return null;
+    const operation = Symbol("ghl-status");
+    statusOperation.current = operation;
+    const guard = captureGhlGuard();
+    ghlStatusVerifiedRef.current = false;
+    setGhlStatusVerified(false);
+    setGhlStatusLoading(true);
+    setGhlStatusError("");
     try {
       const status = await api.oauthStatus();
-      if (!status.connected) return;
-      await saveOrientation({
-        ghlScreen: GHL_CHAPTER_SCREENS,
-        ghlComplete: true,
-        ghlAnswers: { connected: true },
-      });
-      setNotice("GoHighLevel is already connected.");
+      if (!applyGhlConnection(status, guard)) return null;
+      if (options.announce) {
+        setNotice(
+          status.connected
+            ? "GoHighLevel connection refreshed."
+            : "No GoHighLevel subaccount is connected.",
+        );
+      }
+      return status;
     } catch {
-      // A failed status check must not block the hub. Connect can retry.
+      if (ghlGuardCurrent(guard, "workspace")) {
+        setGhlStatusError(
+          "FounderBrain could not verify the connected GoHighLevel subaccount. Your saved work is still here. Refresh status to enable external writes.",
+        );
+      }
+      return null;
+    } finally {
+      if (statusOperation.current === operation) {
+        statusOperation.current = null;
+        if (ghlGuardCurrent(guard, "workspace")) setGhlStatusLoading(false);
+      }
     }
   }
+
+  /** Read-only healing: live CRM state can correct the screen, but never writes stale orientation. */
+  async function healGhlConnection() {
+    const status = await refreshGhlStatus();
+    if (status?.connected) setNotice("GoHighLevel is already connected.");
+  }
+
+  useEffect(() => {
+    if (api && email && view === "ghl") void refreshGhlStatus();
+  }, [api, email, view]);
 
   useEffect(() => {
     if (!api || !email || oauthHandled.current) return;
@@ -299,57 +454,80 @@ export function useFounderBrainApp() {
     const params = new URLSearchParams(window.location.search);
     const code = params.get("code");
     const oauthState = params.get("state");
-    const denied = params.get("error");
+    const denied = params.has("error")
+      ? (params.get("error") || "access_denied").slice(0, 200)
+      : null;
     window.history.replaceState({}, "", "/");
     setView("ghl");
-    if (denied || !code || !oauthState) {
+    if (!oauthState || (!denied && !code)) {
       setError("GoHighLevel Connect did not finish. Try Connect again.");
       return;
     }
-    orientationEpoch.current += 1;
+    if (!denied) {
+      bumpConnectionGeneration();
+      ghlStatusVerifiedRef.current = false;
+      setGhlStatusVerified(false);
+      orientationEpoch.current += 1;
+    }
+    const guard = captureGhlGuard();
+    const operation = Symbol("ghl-connect-callback");
+    connectOperation.current = operation;
     setConnecting(true);
+    setError("");
     void (async () => {
       try {
-        const completed = await api.completeOauth({ code, state: oauthState });
-        orientationEpoch.current += 1;
-        if (completed.orientation) setOrientation(completed.orientation);
-        else {
-          await saveOrientation({
-            ghlScreen: GHL_CHAPTER_SCREENS,
-            ghlComplete: true,
-            ghlAnswers: { connected: true },
-          });
+        if (denied) {
+          await api.completeOauth({ error: denied, state: oauthState });
+          if (ghlGuardCurrent(guard)) {
+            setError("GoHighLevel Connect was cancelled. Start Connect again when you are ready.");
+          }
+          return;
         }
+        const completed = await api.completeOauth({ code: code!, state: oauthState });
+        if (!ghlGuardCurrent(guard)) return;
+        if (!applyGhlConnection(completed, guard)) return;
+        orientationEpoch.current += 1;
+        setOrientation(completed.orientation);
         setNotice("GoHighLevel connected.");
       } catch (err) {
-        setError(friendlyError(err));
+        if (ghlGuardCurrent(guard)) setError(friendlyError(err));
       } finally {
-        setConnecting(false);
+        if (connectOperation.current === operation) {
+          connectOperation.current = null;
+          if (ghlGuardCurrent(guard, "workspace")) setConnecting(false);
+        }
       }
     })();
   }, [api, email]);
 
   async function startConnect() {
-    if (!api) throw new Error("api_unavailable");
+    if (!api || connectOperation.current || disconnectOperation.current) return;
+    const operation = Symbol("ghl-connect");
+    connectOperation.current = operation;
+    let guard = captureGhlGuard();
+    ghlStatusVerifiedRef.current = false;
+    setGhlStatusVerified(false);
     setConnecting(true);
     setError("");
     try {
       const status = await api.oauthStatus();
+      if (!applyGhlConnection(status, guard)) return;
       if (status.connected) {
-        await saveOrientation({
-          ghlScreen: GHL_CHAPTER_SCREENS,
-          ghlComplete: true,
-          ghlAnswers: { connected: true },
-        });
         setNotice("GoHighLevel is already connected.");
-        setConnecting(false);
         return;
       }
+      bumpConnectionGeneration();
+      guard = captureGhlGuard();
       const started = await api.startOauth();
+      if (!ghlGuardCurrent(guard)) return;
       window.location.assign(started.url);
     } catch (err) {
-      setConnecting(false);
-      setError(friendlyError(err));
+      if (ghlGuardCurrent(guard, "workspace")) setError(friendlyError(err));
+    } finally {
+      if (connectOperation.current === operation) {
+        connectOperation.current = null;
+        if (ghlGuardCurrent(guard, "workspace")) setConnecting(false);
+      }
     }
   }
 
@@ -372,6 +550,127 @@ export function useFounderBrainApp() {
     } catch {
       // Routines are an enhancement; never block the workspace on them.
     }
+  }
+
+  /** Founder file uploads: list is re-fetched after every upload/delete so the
+   *  server-computed AI status (full/partial/excluded/unreadable) and the
+   *  usage line stay accurate rather than guessed client-side. */
+  async function loadUploads(options: { silent?: boolean } = {}): Promise<void> {
+    if (!api) return;
+    const epoch = sessionEpoch.current;
+    try {
+      const result = await api.listUploads();
+      if (epoch !== sessionEpoch.current) return;
+      setUploads(result.items);
+      setUploadsAi(result.ai);
+      uploadsLoaded.current = true;
+    } catch (err) {
+      // The mount-time load stays silent: the paperclip and Files screen
+      // degrade to "no files yet" rather than block the workspace. A caller
+      // that just uploaded or deleted a file asks for silent: false so it can
+      // surface the failure instead of losing it quietly.
+      if (options.silent === false) throw err;
+    }
+  }
+
+  async function uploadFile(file: File, questionKey?: string): Promise<UploadItem> {
+    if (!api) throw new Error("api_unavailable");
+    const result = await api.uploadFile(file, questionKey);
+    const item = result.item;
+    // Insert immediately: the upload itself succeeded, so the file must not
+    // vanish from the UI just because the follow-up list refresh fails (#lost-uploads).
+    setUploads((rows) => [item, ...rows.filter((row) => row.id !== item.id)]);
+    // A generated pack read from these files before the upload; the artifact
+    // is now stale until the founder regenerates.
+    setArtifactStale(true);
+    try {
+      await loadUploads({ silent: false });
+    } catch (err) {
+      // The optimistic item above is kept; only the AI usage totals may be
+      // stale until the next successful refresh. Surface it, don't swallow it.
+      setError(friendlyError(err));
+    }
+    return item;
+  }
+
+  async function deleteUploadItem(id: string): Promise<void> {
+    if (!api) throw new Error("api_unavailable");
+    await api.deleteUpload(id);
+    setUploads((rows) => rows.filter((row) => row.id !== id));
+    await loadUploads();
+    setArtifactStale(true);
+  }
+
+  async function downloadUploadItem(id: string, filename: string): Promise<void> {
+    if (!api) throw new Error("api_unavailable");
+    await api.downloadUpload(id, filename);
+  }
+
+  /** Everything the founder can download, zipped client-side with fflate's
+   *  sync API (the CSP has no worker-src, so the async/worker API is out). */
+  async function downloadAllFiles(): Promise<void> {
+    if (!api) throw new Error("api_unavailable");
+    const totalBytes = uploads.reduce((sum, item) => sum + item.sizeBytes, 0);
+    if (totalBytes > MAX_DOWNLOAD_ALL_BYTES) {
+      setError(
+        `Your uploaded files total ${formatBytes(totalBytes)}, over the ` +
+          `${formatBytes(MAX_DOWNLOAD_ALL_BYTES)} zip limit. Download large files individually ` +
+          "instead, from the list above.",
+      );
+      return;
+    }
+    const entries: Record<string, Uint8Array> = {};
+    const used = new Set<string>();
+    const addEntry = (folder: string, name: string, bytes: Uint8Array) => {
+      const path = `${folder}/${name}`;
+      const unique = dedupeFilename(used, path);
+      used.add(unique);
+      entries[unique] = bytes;
+    };
+    // One microtask between fetches so a long file list never blocks the UI thread solid.
+    const yieldToBrowser = () => new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+    for (const item of uploads) {
+      try {
+        const blob = await api.downloadUploadBlob(item.id);
+        addEntry("Uploaded by you", item.name, new Uint8Array(await blob.arrayBuffer()));
+      } catch {
+        // Skip a file that fails to fetch rather than failing the whole zip.
+      }
+      await yieldToBrowser();
+    }
+    try {
+      const md = await api.exportBlob("markdown");
+      addEntry("Created by FounderBrain", "brain.md", new Uint8Array(await md.arrayBuffer()));
+    } catch {
+      /* omit on failure */
+    }
+    try {
+      const json = await api.exportBlob("json");
+      addEntry("Created by FounderBrain", "brain.json", new Uint8Array(await json.arrayBuffer()));
+    } catch {
+      /* omit on failure */
+    }
+    if (artifactText && isPack(artifactText)) {
+      const sections = splitPack(artifactText);
+      const named: Array<[string, string]> = [
+        ["content.md", sections.content],
+        ["outreach.md", sections.outreach],
+        ["90-day-plan.md", sections.plan],
+      ];
+      for (const [name, text] of named) {
+        if (text.trim()) addEntry("Created by FounderBrain", name, strToU8(text));
+      }
+    } else if (artifactText.trim()) {
+      addEntry("Created by FounderBrain", "output.md", strToU8(artifactText));
+    }
+    const zipped = zipSync(entries, { level: 6 });
+    const blob = new Blob([zipped], { type: "application/zip" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "founder-brain-files.zip";
+    link.click();
+    URL.revokeObjectURL(url);
   }
 
   async function setDraftStatus(id: string, status: "read" | "dismissed") {
@@ -408,9 +707,141 @@ export function useFounderBrainApp() {
     }
     return result.pieces;
   }
-  async function ghlPush(pack?: string) {
-    if (!api) throw new Error("api_unavailable");
-    return api.ghlPush(pack);
+  function requireVerifiedGhlConnection(): GhlConnectionStatus {
+    const connection = ghlConnectionRef.current;
+    if (
+      !connection?.connected ||
+      !connection.connectionId ||
+      !connection.locationId ||
+      !ghlStatusVerifiedRef.current ||
+      disconnectOperation.current
+    ) {
+      throw new ApiError(
+        409,
+        "ghl_connection_unverified",
+        "Refresh GoHighLevel status before writing anything externally.",
+      );
+    }
+    return connection;
+  }
+
+  async function disconnectGhl() {
+    if (!api || disconnectOperation.current || connectOperation.current) return null;
+    const connection = requireVerifiedGhlConnection();
+    const operation = Symbol("ghl-disconnect");
+    disconnectOperation.current = operation;
+    bumpConnectionGeneration();
+    const guard = captureGhlGuard();
+    ghlStatusVerifiedRef.current = false;
+    setGhlStatusVerified(false);
+    setDisconnecting(true);
+    setGhlStatusError("");
+    try {
+      const result = await api.disconnectOauth(connection.connectionId!);
+      if (!ghlGuardCurrent(guard)) return null;
+      if (!applyGhlConnection(result, guard)) return null;
+      orientationEpoch.current += 1;
+      setOrientation(result.orientation);
+      resetGhlLinks();
+      setNotice(
+        "FounderBrain disconnected from GoHighLevel. Existing GoHighLevel content and workflows were not deleted.",
+      );
+      return result;
+    } catch (err) {
+      if (ghlGuardCurrent(guard)) setGhlStatusError(friendlyError(err));
+      throw err;
+    } finally {
+      if (disconnectOperation.current === operation) {
+        disconnectOperation.current = null;
+        if (ghlGuardCurrent(guard, "workspace")) setDisconnecting(false);
+      }
+    }
+  }
+
+  async function loadGhlBookingLinks() {
+    if (!api || bookingLoadOperation.current) return null;
+    const connection = requireVerifiedGhlConnection();
+    const operation = Symbol("ghl-booking-read");
+    bookingLoadOperation.current = operation;
+    const guard = captureGhlGuard();
+    setGhlBookingLoading(true);
+    setGhlBookingError("");
+    try {
+      const result = await api.ghlBookingLinks(connection.connectionId!);
+      if (!ghlGuardCurrent(guard)) return null;
+      if (result.connection.connectionId !== connection.connectionId) {
+        invalidateGhlIdentity();
+        return null;
+      }
+      setGhlBookingLinks(result);
+      return result;
+    } catch (err) {
+      if (ghlGuardCurrent(guard)) setGhlBookingError(friendlyError(err));
+      return null;
+    } finally {
+      if (bookingLoadOperation.current === operation) {
+        bookingLoadOperation.current = null;
+        if (ghlGuardCurrent(guard, "workspace")) setGhlBookingLoading(false);
+      }
+    }
+  }
+
+  async function saveGhlBookingLink(
+    input: Omit<GhlBookingLinkInput, "connectionId">,
+  ): Promise<GhlBookingLinkResult | null> {
+    if (!api || bookingWriteOperation.current) return null;
+    const connection = requireVerifiedGhlConnection();
+    const operation = Symbol("ghl-booking-write");
+    bookingWriteOperation.current = operation;
+    const guard = captureGhlGuard();
+    setGhlLinkSavingKey(input.key);
+    setGhlBookingError("");
+    try {
+      const result = await api.saveGhlBookingLink({
+        ...input,
+        connectionId: connection.connectionId!,
+      });
+      if (!ghlGuardCurrent(guard)) return null;
+      if (result.connection.connectionId !== connection.connectionId) {
+        invalidateGhlIdentity();
+        return null;
+      }
+      setGhlBookingLinks((current) => {
+        if (!current || current.connection.connectionId !== connection.connectionId) return current;
+        return {
+          connection: result.connection,
+          links: current.links.map((link) => (link.key === result.link.key ? result.link : link)),
+        };
+      });
+      return result;
+    } catch (err) {
+      if (ghlGuardCurrent(guard)) setGhlBookingError(friendlyError(err));
+      throw err;
+    } finally {
+      if (bookingWriteOperation.current === operation) {
+        bookingWriteOperation.current = null;
+        if (ghlGuardCurrent(guard, "workspace")) setGhlLinkSavingKey(null);
+      }
+    }
+  }
+
+  async function ghlPush(pack?: string): Promise<GhlPushResult | null> {
+    if (!api || pushOperation.current) return null;
+    const connection = requireVerifiedGhlConnection();
+    const operation = Symbol("ghl-push");
+    pushOperation.current = operation;
+    const guard = captureGhlGuard();
+    try {
+      const result = await api.ghlPush(connection.connectionId!, pack);
+      if (!ghlGuardCurrent(guard)) return null;
+      if (result.connection.connectionId !== connection.connectionId) {
+        invalidateGhlIdentity();
+        return null;
+      }
+      return result;
+    } finally {
+      if (pushOperation.current === operation) pushOperation.current = null;
+    }
   }
   async function transcribeVoice(blob: Blob, seconds: number) {
     if (!api) throw new Error("api_unavailable");
@@ -487,7 +918,11 @@ export function useFounderBrainApp() {
     if (!saved) throw new Error("The imported answers have not been saved yet. Please retry.");
   }
 
-  function patch(section: Exclude<Mission, "output">, field: string, value: string | boolean | number) {
+  function patch(
+    section: Exclude<Mission, "output">,
+    field: string,
+    value: string | boolean | number,
+  ) {
     if (saving) return;
     // Background synchronization and repeated choices are not edits.
     const prior = (latestDraft.current[section] as unknown as Record<string, unknown>)[field];
@@ -716,7 +1151,21 @@ export function useFounderBrainApp() {
             setError("Your Brain has updated to a new version. Rebuild before accepting.");
             return;
           }
-          throw new Error(message);
+          // Uploaded files changing mid-job is the same kind of staleness as the
+          // Brain changing: mark stale and offer a rebuild.
+          if (/files changed/i.test(message)) {
+            setArtifactStale(true);
+            setGenerationRetry(true);
+            setError("Your files changed since this draft was started. Rebuild before accepting.");
+            return;
+          }
+          // Any other failure: job.error is a plain string, not an ApiError, so
+          // it must be shown directly. friendlyError() below only passes through
+          // ApiError messages and would otherwise flatten it to a generic line
+          // (#lost-job-error-text).
+          setJobNeedsReconcile(true);
+          setError(job.error || "Generation did not complete.");
+          return;
         }
         if (outcome.kind === "uncertain") {
           window.sessionStorage.removeItem(jobStorage);
@@ -808,7 +1257,11 @@ export function useFounderBrainApp() {
             err instanceof ApiError
               ? ((err.details as { details?: { jobId?: unknown; status?: unknown } }).details ?? {})
               : {};
-          if (err instanceof ApiError && err.code === "job_active" && typeof activeJob.jobId === "string") {
+          if (
+            err instanceof ApiError &&
+            err.code === "job_active" &&
+            typeof activeJob.jobId === "string"
+          ) {
             if (activeJob.status === "uncertain") {
               jobOperation.current = {
                 expectedVersion: current.version,
@@ -1086,9 +1539,30 @@ export function useFounderBrainApp() {
     deleteVoiceSample,
     routineDrafts,
     setDraftStatus,
+    uploads,
+    uploadsAi,
+    loadUploads,
+    uploadFile,
+    deleteUploadItem,
+    downloadUploadItem,
+    downloadAllFiles,
     ghlPush,
     regeneratePieces,
     connecting,
+    disconnecting,
     startConnect,
+    refreshGhlStatus,
+    disconnectGhl,
+    ghlConnection,
+    ghlStatusVerified,
+    ghlStatusLoading,
+    ghlStatusError,
+    ghlConnectionGeneration,
+    ghlBookingLinks,
+    ghlBookingLoading,
+    ghlBookingError,
+    ghlLinkSavingKey,
+    loadGhlBookingLinks,
+    saveGhlBookingLink,
   };
 }

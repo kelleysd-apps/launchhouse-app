@@ -21,6 +21,12 @@ import { ceilMicro, recordUsageEvent } from "./usage.ts";
 import { present, type Brain } from "../founderbrain-shared/domain.ts";
 import type { Config } from "./config.ts";
 import type { PgBrainStore } from "./store.ts";
+import type { GhlPushResult } from "../founderbrain-shared/ghl.ts";
+import {
+  readConnectionUnlocked,
+  statusForConnectionUnlocked,
+  withCrmOperationLock,
+} from "./crm-oauth.ts";
 
 const GHL_API = "https://services.leadconnectorhq.com";
 const GHL_VERSION = "2021-07-28";
@@ -221,10 +227,6 @@ function isUnfilled(value: string | undefined): boolean {
   return /PLACEHOLDER/i.test(value) || /\[[^\]]+\]/.test(value) || /\{\{[^}]+\}\}/.test(value);
 }
 
-function hasValue(entry: { value?: string }): boolean {
-  return Object.prototype.hasOwnProperty.call(entry, "value");
-}
-
 async function ghlRefusal(name: string, response: Response): Promise<string> {
   const body = await response.text();
   let reason = "";
@@ -242,123 +244,241 @@ async function ghlRefusal(name: string, response: Response): Promise<string> {
   return `GoHighLevel refused "${name}" (${response.status}${reason}). Try again.`;
 }
 
-/** List and get omit `value` when the slot is empty. A failed read must not be treated as empty. */
-async function readCustomValue(
+export async function parseCustomValuesList(
+  response: Response,
+  message: string,
+): Promise<GhlValue[]> {
+  let json: unknown;
+  try {
+    json = await response.json();
+  } catch {
+    throw new DomainError(422, "ghl_push_failed", message);
+  }
+  if (!json || typeof json !== "object" || !Array.isArray((json as { customValues?: unknown }).customValues))
+    throw new DomainError(422, "ghl_push_failed", message);
+  const values: GhlValue[] = [];
+  for (const raw of (json as { customValues: unknown[] }).customValues) {
+    if (!raw || typeof raw !== "object")
+      throw new DomainError(422, "ghl_push_failed", message);
+    const item = raw as { id?: unknown; name?: unknown; value?: unknown };
+    if (typeof item.id !== "string" || !item.id || typeof item.name !== "string" || !item.name)
+      throw new DomainError(422, "ghl_push_failed", message);
+    if (Object.prototype.hasOwnProperty.call(item, "value") && typeof item.value !== "string")
+      throw new DomainError(422, "ghl_push_failed", message);
+    values.push({
+      id: item.id,
+      name: item.name,
+      ...(typeof item.value === "string" ? { value: item.value } : {}),
+    });
+  }
+  return values;
+}
+
+export function targetedValues(values: GhlValue[], names: Set<string>): Map<string, GhlValue> {
+  const mapped = new Map<string, GhlValue>();
+  for (const value of values) {
+    if (!names.has(value.name)) continue;
+    if (mapped.has(value.name))
+      throw new DomainError(409, "ghl_values_ambiguous", `GoHighLevel has more than one "${value.name}" value. Remove the duplicate before continuing.`);
+    mapped.set(value.name, value);
+  }
+  return mapped;
+}
+
+/** A missing value is empty only after exact detail identity validation. */
+export async function readCustomValue(
   accessToken: string,
   locationId: string,
   entry: GhlValue,
 ): Promise<{ readable: boolean; text?: string }> {
-  if (hasValue(entry)) return { readable: true, text: entry.value };
-  const got = await ghlFetch(accessToken, `/locations/${locationId}/customValues/${entry.id}`);
+  const got = await ghlFetch(
+    accessToken,
+    `/locations/${encodeURIComponent(locationId)}/customValues/${encodeURIComponent(entry.id)}`,
+  );
   if (!got.ok) return { readable: false };
-  const json = (await got.json()) as { customValue?: GhlValue };
-  const item = json.customValue ?? (json as GhlValue);
-  if (hasValue(item)) return { readable: true, text: item.value };
-  return { readable: true, text: undefined };
+  let json: unknown;
+  try {
+    json = await got.json();
+  } catch {
+    return { readable: false };
+  }
+  if (!json || typeof json !== "object") return { readable: false };
+  const item = (json as { customValue?: unknown }).customValue;
+  if (!item || typeof item !== "object") return { readable: false };
+  const detail = item as { id?: unknown; name?: unknown; locationId?: unknown; value?: unknown };
+  if (detail.id !== entry.id || detail.name !== entry.name || detail.locationId !== locationId)
+    return { readable: false };
+  if (!Object.prototype.hasOwnProperty.call(detail, "value")) return { readable: true };
+  if (typeof detail.value !== "string") return { readable: false };
+  return { readable: true, text: detail.value };
 }
 
 export async function pushGhlValues(
   config: Config,
   store: PgBrainStore,
   workspace: string,
+  expectedConnectionId: string,
   brain: Brain,
   firstPack: string,
   acceptedPack = "",
-): Promise<{ snapshot: SnapshotName; firstPack: string; pushed: string[]; skipped: string[]; proven: boolean; clinicPaste: string[]; held: Array<{ name: string; code: string; reason: string }> }> {
-  const connection = await (await import("./crm-oauth.ts")).readConnection(store, workspace, config);
-  if (!connection)
-    throw new DomainError(409, "crm_not_connected", "Connect GoHighLevel before pushing copy.");
-  const wanted = sectionsForPush(brain, firstPack);
-  // Booking links are the founder's own URLs, pasted at the clinic. AI never
-  // writes a link: it would invent one.
-  const linkKeys = wanted.filter((w) => /_link$/.test(w.key)).map((w) => w.gname);
-  const copyWanted = wanted.filter((w) => !/_link$/.test(w.key));
-  const { copy, held } = await generateCopy(config, store, workspace, brain, copyWanted, acceptedPack);
+): Promise<GhlPushResult> {
+  return withCrmOperationLock(store, workspace, async (tx) => {
+    // Reject a stale browser generation before provider writes or paid AI.
+    const connection = await readConnectionUnlocked(
+      store,
+      tx,
+      workspace,
+      config,
+      expectedConnectionId,
+    );
+    if (!connection)
+      throw new DomainError(409, "crm_not_connected", "Connect GoHighLevel before pushing copy.");
 
-  const listResponse = await ghlFetch(connection.accessToken, `/locations/${connection.locationId}/customValues`);
-  if (!listResponse.ok)
-    throw new DomainError(422, "ghl_push_failed", "GoHighLevel did not answer the values list. Try again.");
-  const listJson = (await listResponse.json()) as { customValues?: GhlValue[] };
-  const existing = new Map((listJson.customValues ?? []).map((v) => [v.name, v]));
+    const wanted = sectionsForPush(brain, firstPack);
+    const linkWanted = wanted.filter((w) => /_link$/.test(w.key));
+    const copyWanted = wanted.filter((w) => !/_link$/.test(w.key));
 
-  const pushed: string[] = [];
-  const skipped: string[] = [];
-  const unread: string[] = [];
-  for (const w of wanted) {
-    const value = copy.get(w.gname);
-    if (!value) continue;
-    const current = existing.get(w.gname);
-    // The founder's own words win: never overwrite a filled value.
-    if (current) {
+    // Read the location first. This both protects existing values and lets the
+    // response report only booking links that are actually still missing.
+    const listResponse = await ghlFetch(
+      connection.accessToken,
+      `/locations/${connection.locationId}/customValues`,
+    );
+    if (!listResponse.ok)
+      throw new DomainError(422, "ghl_push_failed", "GoHighLevel did not answer the values list. Try again.");
+    const listed = await parseCustomValuesList(
+      listResponse,
+      "GoHighLevel returned an unknown values list. Try again.",
+    );
+    const wantedNames = new Set(wanted.map((value) => value.gname));
+    const existing = targetedValues(listed, wantedNames);
+
+    const clinicPaste: string[] = [];
+    for (const link of linkWanted) {
+      const current = existing.get(link.gname);
+      if (!current) {
+        clinicPaste.push(link.gname);
+        continue;
+      }
       const read = await readCustomValue(connection.accessToken, connection.locationId, current);
-      // A failed read is not proof the slot is empty. Leave founder words alone.
-      if (!read.readable) {
-        unread.push(w.gname);
-        continue;
+      if (!read.readable)
+        throw new DomainError(422, "ghl_push_failed", `GoHighLevel did not return "${link.gname}". Try again.`);
+      if (isUnfilled(read.text)) clinicPaste.push(link.gname);
+    }
+
+    // Booking links are founder-provided values. AI sees only copy slots and can
+    // never generate, inspect, or fetch a pasted URL.
+    const { copy, held } = await generateCopy(
+      config,
+      store,
+      workspace,
+      brain,
+      copyWanted,
+      acceptedPack,
+    );
+
+    const pushed: string[] = [];
+    const skipped: string[] = [];
+    const unread: string[] = [];
+    for (const w of copyWanted) {
+      const value = copy.get(w.gname);
+      if (!value) continue;
+      const current = existing.get(w.gname);
+      // The founder's own words win: never overwrite a filled value.
+      if (current) {
+        const read = await readCustomValue(connection.accessToken, connection.locationId, current);
+        if (!read.readable) {
+          unread.push(w.gname);
+          continue;
+        }
+        if (!isUnfilled(read.text)) {
+          skipped.push(w.gname);
+          continue;
+        }
+        const updated = await ghlFetch(
+          connection.accessToken,
+          `/locations/${connection.locationId}/customValues/${current.id}`,
+          { method: "PUT", body: ghlCustomValueBody(w.gname, value) },
+        );
+        if (!updated.ok)
+          throw new DomainError(422, "ghl_push_failed", await ghlRefusal(w.gname, updated));
+        pushed.push(w.gname);
+      } else {
+        const created = await ghlFetch(
+          connection.accessToken,
+          `/locations/${connection.locationId}/customValues`,
+          { method: "POST", body: ghlCustomValueBody(w.gname, value) },
+        );
+        if (!created.ok)
+          throw new DomainError(422, "ghl_push_failed", await ghlRefusal(w.gname, created));
+        pushed.push(w.gname);
       }
-      if (!isUnfilled(read.text)) {
-        skipped.push(w.gname);
-        continue;
-      }
-      const updated = await ghlFetch(
-        connection.accessToken,
-        `/locations/${connection.locationId}/customValues/${current.id}`,
-        { method: "PUT", body: ghlCustomValueBody(w.gname, value) },
-      );
-      if (!updated.ok) throw new DomainError(422, "ghl_push_failed", await ghlRefusal(w.gname, updated));
-      pushed.push(w.gname);
-    } else {
-      const created = await ghlFetch(
+    }
+    if (unread.length > 0)
+      throw new DomainError(422, "ghl_push_failed", `GoHighLevel did not return "${unread[0]}". Try again.`);
+
+    const connectionStatus = await statusForConnectionUnlocked(connection);
+    if (pushed.length === 0 && skipped.length === copyWanted.length) {
+      return {
+        connection: connectionStatus,
+        snapshot: snapshotFor(brain),
+        firstPack,
+        pushed,
+        skipped,
+        proven: true,
+        clinicPaste,
+        held,
+      };
+    }
+
+    let proven = false;
+    for (let attempt = 0; attempt < VERIFY_ATTEMPTS && !proven; attempt++) {
+      if (attempt > 0) await sleep(VERIFY_RETRY_MS);
+      const verify = await ghlFetch(
         connection.accessToken,
         `/locations/${connection.locationId}/customValues`,
-        { method: "POST", body: ghlCustomValueBody(w.gname, value) },
       );
-      if (!created.ok) throw new DomainError(422, "ghl_push_failed", await ghlRefusal(w.gname, created));
-      pushed.push(w.gname);
-    }
-  }
-  if (unread.length > 0)
-    throw new DomainError(422, "ghl_push_failed", `GoHighLevel did not return "${unread[0]}". Try again.`);
-  if (pushed.length === 0 && skipped.length === wanted.length)
-    return { snapshot: snapshotFor(brain), firstPack, pushed, skipped, proven: true, clinicPaste: linkKeys, held };
-
-  // Prove it: nothing we claim to have written may still read empty or placeholder.
-  // GHL's customValues list read can lag the writes by a few seconds (#76): the first
-  // verify after a fresh location's first push came back without the new values even
-  // though every write returned ok. Read back a few times before declaring failure.
-  let proven = false;
-  for (let attempt = 0; attempt < VERIFY_ATTEMPTS && !proven; attempt++) {
-    if (attempt > 0) await sleep(VERIFY_RETRY_MS);
-    const verify = await ghlFetch(connection.accessToken, `/locations/${connection.locationId}/customValues`);
-    if (!verify.ok)
-      throw new DomainError(422, "ghl_push_failed", "Could not verify the push. Check GoHighLevel and retry.");
-    const verifyJson = (await verify.json()) as { customValues?: GhlValue[] };
-    const verifyMap = new Map((verifyJson.customValues ?? []).map((v) => [v.name, v]));
-    proven = true;
-    for (const [gname] of copy.entries()) {
-      const listed = verifyMap.get(gname);
-      if (!listed) {
-        proven = false;
-        break;
-      }
-      const read = await readCustomValue(connection.accessToken, connection.locationId, listed);
-      if (!read.readable || isUnfilled(read.text)) {
-        proven = false;
-        break;
+      if (!verify.ok)
+        throw new DomainError(422, "ghl_push_failed", "Could not verify the push. Check GoHighLevel and retry.");
+      const verifyValues = await parseCustomValuesList(
+        verify,
+        "Could not verify the push because GoHighLevel returned an unknown values list.",
+      );
+      const verifyMap = targetedValues(verifyValues, new Set(copy.keys()));
+      proven = true;
+      for (const [gname] of copy.entries()) {
+        const value = verifyMap.get(gname);
+        if (!value) {
+          proven = false;
+          break;
+        }
+        const read = await readCustomValue(connection.accessToken, connection.locationId, value);
+        if (!read.readable || isUnfilled(read.text)) {
+          proven = false;
+          break;
+        }
       }
     }
-  }
-  if (!proven) {
-    const wrote = pushed.length > 0;
-    throw new DomainError(
-      422,
-      "ghl_push_failed",
-      wrote
-        ? "The copy is in GoHighLevel but the read-back check could not confirm it. Open the values list to confirm, or retry."
-        : "The push did not stick. Nothing was published. Check the snapshot names match the values list.",
-    );
-  }
-  return { snapshot: snapshotFor(brain), firstPack, pushed, skipped, proven, clinicPaste: linkKeys, held };
+    if (!proven) {
+      throw new DomainError(
+        422,
+        "ghl_push_failed",
+        pushed.length > 0
+          ? "The copy is in GoHighLevel but the read-back check could not confirm it. Open the values list to confirm, or retry."
+          : "The push did not stick. Nothing was published. Check the snapshot names match the values list.",
+      );
+    }
+    return {
+      connection: connectionStatus,
+      snapshot: snapshotFor(brain),
+      firstPack,
+      pushed,
+      skipped,
+      proven,
+      clinicPaste,
+      held,
+    };
+  });
 }
 
 /** Export helper for tests: is this Brain ready to push (all five missions approved)? */

@@ -16,6 +16,7 @@ import {
   DomainError,
   canonicalize,
   generationPayload,
+  MAX_PINNED_BODY_BYTES,
   type Artifact,
 } from "./domain.ts";
 import type { Config } from "./config.ts";
@@ -27,7 +28,14 @@ import { buildOrchestrationFromConfig, orchestrateInvitation } from "./orchestra
 import { keyIsUsable, loadOpenRouterApiKey, recordOpenRouterSpend } from "./openrouter-keys.ts";
 import type { OrchestrationRole, RoleModels } from "./openrouter-privacy.ts";
 import { OPENROUTER_LIFETIME_USD } from "./openrouter-management.ts";
-import { ceilMicro, insertUsageEvent, pricedUsageEvent, recordUsageEvent, type UsageEvent } from "./usage.ts";
+import {
+  ceilMicro,
+  insertUsageEvent,
+  pricedUsageEvent,
+  recordUsageEvent,
+  type UsageEvent,
+} from "./usage.ts";
+import { documentBudgetBytes, currentUploadAllocation, EMPTY_CORPUS_HASH } from "./uploads.ts";
 
 export type { Provider, ProviderResult } from "./provider.ts";
 
@@ -39,6 +47,7 @@ type ArtifactRow = {
   source_version: number | string;
   source_hash: string;
   input_hash: string;
+  uploads_hash: string | null;
   accepted_at: Date | string | null;
   created_at: Date | string;
 };
@@ -178,21 +187,46 @@ export class BrainJobs {
     }
     const { meta } = await loadOpenRouterApiKey(this.store, workspace);
     keyIsUsable(meta);
-    const payload = generationPayload(state.brain);
     const roles = buildOrchestrationFromConfig({
       thinker: this.config.AI_MODEL_THINKER,
       runner: this.config.AI_MODEL_RUNNER ?? this.config.AI_MODEL,
       verifier: this.config.AI_MODEL_VERIFIER,
     });
-    const pinned: Pinned = {
+    // Documents get only whatever room is left under the hard cap once the Brain's
+    // own content (with no documents yet) is accounted for, minus a safety margin —
+    // see uploads.ts's documentBudgetBytes. The cap itself never moves for them.
+    const availableForDocs = documentBudgetBytes(this.config, state.brain);
+    const { allocation } = await currentUploadAllocation(this.store, workspace, availableForDocs);
+    let uploadsHash = allocation.corpusHash;
+    let payload = generationPayload(state.brain, allocation.documents);
+    let pinned: Pinned = {
       roles,
       system: payload.system,
       userContent: payload.messages[0]!.content,
       inputRate: this.config.AI_INPUT_USD_PER_MILLION!,
       outputRate: this.config.AI_OUTPUT_USD_PER_MILLION!,
     };
-    const body = canonicalize(pinned);
-    if (Buffer.byteLength(body) > 32000) {
+    let body = canonicalize(pinned);
+    if (Buffer.byteLength(body) > MAX_PINNED_BODY_BYTES && allocation.documents.length > 0) {
+      // Defense in depth. allocateDocumentContext costs documents against the
+      // real double-encoded body size, so this should not happen — but a
+      // founder must never see "shorten your Brain" over documents they
+      // uploaded, only over a genuinely oversized Brain. Drop the documents
+      // entirely and rebuild rather than fail the generation; GET /api/uploads
+      // reflects the same corpus hash change (EMPTY_CORPUS_HASH) the next time
+      // it is read, so nothing here diverges from what actually ran.
+      uploadsHash = EMPTY_CORPUS_HASH;
+      payload = generationPayload(state.brain, []);
+      pinned = {
+        roles,
+        system: payload.system,
+        userContent: payload.messages[0]!.content,
+        inputRate: this.config.AI_INPUT_USD_PER_MILLION!,
+        outputRate: this.config.AI_OUTPUT_USD_PER_MILLION!,
+      };
+      body = canonicalize(pinned);
+    }
+    if (Buffer.byteLength(body) > MAX_PINNED_BODY_BYTES) {
       throw new DomainError(
         422,
         "input_too_large",
@@ -279,10 +313,10 @@ export class BrainJobs {
       await tx`
         insert into fb_ai_job (
           id, founder_id, idempotency_key, source_version, source_hash,
-          input_hash, input_blob_sha, status, reserved, budget_day
+          input_hash, input_blob_sha, status, reserved, budget_day, uploads_hash
         ) values (
           ${id}, ${workspace}, ${key}, ${state.version}, ${state.sha},
-          ${hash(body)}, ${blob}, 'queued', ${reserve}, ${day}
+          ${hash(body)}, ${blob}, 'queued', ${reserve}, ${day}, ${uploadsHash}
         )
       `;
       await tx`
@@ -318,6 +352,7 @@ export class BrainJobs {
       sourceVersion: Number(a.source_version),
       sourceHash: a.source_hash,
       inputHash: a.input_hash,
+      uploadsHash: a.uploads_hash,
       acceptedAt: a.accepted_at ? new Date(a.accepted_at).toISOString() : null,
       createdAt: new Date(a.created_at).toISOString(),
     };
@@ -396,6 +431,18 @@ export class BrainJobs {
       );
     }
     const requestHash = hash(canonicalize({ text: normalized, expectedVersion }));
+    // Read outside the write transaction, same as enqueue() does: by the time
+    // the version check below passes, the current Brain (read here, moments
+    // earlier) and the Brain the transaction confirms are current are the
+    // same content — a genuine race is still caught, just by that version
+    // check instead, which already throws stale_proposal.
+    const currentState = await this.store.read(workspace);
+    const currentDocBudget = documentBudgetBytes(this.config, currentState.brain);
+    const { allocation: currentAllocation } = await currentUploadAllocation(
+      this.store,
+      workspace,
+      currentDocBudget,
+    );
     await this.store.scoped(workspace, async (tx: Tx) => {
       await tx`select pg_advisory_xact_lock(hashtext(${workspace}))`;
       const r =
@@ -415,6 +462,19 @@ export class BrainJobs {
         Number(f[0]?.version) !== expectedVersion ||
         Number(a.source_version) !== expectedVersion
       ) {
+        throw new DomainError(
+          409,
+          "stale_proposal",
+          "Your Brain changed since generation. Regenerate before accepting.",
+        );
+      }
+      // The Brain version matches, but the uploaded-document corpus this
+      // artifact was generated with may not match what exists now (a file
+      // added, removed, or reallocated since). Reject with the same stale
+      // error a Brain change would give — from the founder's side, either way
+      // the artifact no longer reflects what a fresh generation would read.
+      const artifactUploadsHash = (a.uploads_hash as string | null) ?? EMPTY_CORPUS_HASH;
+      if (artifactUploadsHash !== currentAllocation.corpusHash) {
         throw new DomainError(
           409,
           "stale_proposal",
@@ -523,6 +583,29 @@ export class BrainJobs {
           update fb_ai_job
           set status = 'failed',
               error = 'Brain changed before generation. Generate again.'
+          where founder_id = ${workspace} and id = ${j.id}
+        `;
+        await tx`update fb_job_dispatch set status='failed' where job_id=${j.id}`;
+        return null;
+      }
+      // The Brain itself is unchanged, but a deleted upload must never reach a
+      // running generation: recompute the current corpus hash the exact same
+      // way GET /api/uploads does, against the same budget this job was
+      // pinned with, and compare it to what was recorded at enqueue time.
+      const priorState = await this.store.read(workspace, Number(j.source_version));
+      const docBudget = documentBudgetBytes(this.config, priorState.brain);
+      const { allocation: currentAllocation } = await currentUploadAllocation(
+        this.store,
+        workspace,
+        docBudget,
+      );
+      const jobUploadsHash = (j.uploads_hash as string | null) ?? EMPTY_CORPUS_HASH;
+      if (currentAllocation.corpusHash !== jobUploadsHash) {
+        await this.settle(tx, workspace, j as JobBudgetRow, 0);
+        await tx`
+          update fb_ai_job
+          set status = 'failed',
+              error = 'Your files changed before generation. Generate again.'
           where founder_id = ${workspace} and id = ${j.id}
         `;
         await tx`update fb_job_dispatch set status='failed' where job_id=${j.id}`;
@@ -648,13 +731,18 @@ export class BrainJobs {
           costMicroUsd: cost,
           jobId: job.id,
         };
-        await insertUsageEvent(tx, workspace, usageEvent, pricedUsageEvent(this.config, usageEvent));
+        await insertUsageEvent(
+          tx,
+          workspace,
+          usageEvent,
+          pricedUsageEvent(this.config, usageEvent),
+        );
         await tx`
           insert into fb_artifact (
-            id, founder_id, job_id, source_version, source_hash, input_hash, draft_sha
+            id, founder_id, job_id, source_version, source_hash, input_hash, draft_sha, uploads_hash
           ) values (
             ${randomUUID()}, ${workspace}, ${job.id}, ${job.source_version},
-            ${job.source_hash}, ${job.input_hash}, ${sha}
+            ${job.source_hash}, ${job.input_hash}, ${sha}, ${job.uploads_hash}
           )
           on conflict (founder_id, job_id) do nothing
         `;
@@ -774,11 +862,7 @@ export class BrainJobs {
   }
 
   /** Renew the running job lease so multi-step orchestration cannot expire mid-flight. */
-  private async extendJobLease(
-    workspace: string,
-    jobId: string,
-    fence: number,
-  ): Promise<void> {
+  private async extendJobLease(workspace: string, jobId: string, fence: number): Promise<void> {
     await this.store.scoped(workspace, async (tx: Tx) => {
       const extended = await tx`
         update fb_ai_job

@@ -1,0 +1,258 @@
+/**
+ * src/founderbrain-web/uploads.css
+ *
+ * Founder file uploads: the paperclip beside the mic on every typeform
+ * question, its attached-file chips, and the "Uploaded by you" / "Created by
+ * FounderBrain" sections of the Files screen. Same glass-stage palette as
+ * styles.css (--ink / --paper / --ember).
+ */
+
+/* Paperclip sits left of the mic, inside the same absolutely-positioned row.
+   `.typeform-name` only gets the extra padding when a clip is actually there. */
+.typeform-name:has(.upload-clip) {
+  padding-right: 6.2rem;
+}
+.upload-clip {
+  position: absolute;
+  right: 3.4rem;
+  bottom: 0.35rem;
+  width: 2.8rem;
+  height: 2.8rem;
+  border: 1px solid rgba(247, 239, 230, 0.35);
+  border-radius: 999px;
+  background: rgba(18, 12, 20, 0.35);
+  color: var(--paper);
+  display: grid;
+  place-items: center;
+  padding: 0;
+}
+.upload-clip svg {
+  width: 1.2rem;
+  height: 1.2rem;
+}
+.upload-clip:hover,
+.upload-clip:focus-visible {
+  background: var(--ember);
+  border-color: var(--ember);
+  color: var(--ink);
+}
+.upload-clip:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.upload-attach {
+  position: absolute;
+  inset: auto 0 auto auto;
+}
+.upload-chips {
+  position: absolute;
+  right: 0;
+  top: 100%;
+  margin-top: 0.5rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  max-width: min(100%, 26rem);
+  justify-content: flex-end;
+}
+.upload-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.78rem;
+  color: var(--paper);
+  background: rgba(247, 239, 230, 0.08);
+  border: 1px solid rgba(247, 239, 230, 0.22);
+  border-radius: 999px;
+  padding: 0.3rem 0.35rem 0.3rem 0.7rem;
+  max-width: 100%;
+}
+.upload-chip.busy {
+  color: var(--paper-muted);
+  font-style: italic;
+}
+.upload-chip button {
+  appearance: none;
+  border: none;
+  background: none;
+  color: var(--paper-muted);
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0.1rem 0.3rem;
+  cursor: pointer;
+}
+.upload-chip button:hover {
+  color: var(--ember);
+}
+.upload-chip-error {
+  font-size: 0.78rem;
+  color: #ffb4a8;
+  max-width: 100%;
+}
+
+/* Files screen: "Uploaded by you" and "Created by FounderBrain" sections. */
+.upload-usage-line {
+  margin: 0.6rem 0 0;
+  color: var(--paper-muted);
+  font-size: 0.9rem;
+}
+.upload-list {
+  list-style: none;
+  margin: 0.85rem 0 0;
+  padding: 0;
+  display: grid;
+  gap: 0.5rem;
+}
+.upload-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem 0.9rem;
+  padding: 0.65rem 0.85rem;
+  border: 1px solid rgba(247, 239, 230, 0.14);
+  border-radius: 10px;
+  background: rgba(247, 239, 230, 0.03);
+}
+.upload-row-meta {
+  display: grid;
+  gap: 0.15rem;
+  min-width: 0;
+}
+.upload-row-name {
+  font-family: var(--font-brand);
+  font-size: 0.98rem;
+  color: var(--paper);
+  overflow-wrap: anywhere;
+}
+.upload-row-detail {
+  font-size: 0.78rem;
+  color: var(--paper-muted);
+}
+.upload-badge {
+  display: inline-block;
+  margin-top: 0.15rem;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid rgba(247, 239, 230, 0.28);
+  color: var(--paper-muted);
+}
+.upload-badge.full {
+  color: #8ce6bd;
+  border-color: rgba(140, 230, 189, 0.5);
+}
+.upload-badge.partial {
+  color: var(--ember);
+  border-color: rgba(224, 137, 74, 0.5);
+}
+.upload-badge.excluded,
+.upload-badge.unreadable {
+  color: #ffb4a8;
+  border-color: rgba(255, 180, 168, 0.5);
+}
+.upload-row-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-shrink: 0;
+}
+.upload-created-list {
+  list-style: none;
+  margin: 0.85rem 0 0;
+  padding: 0;
+  display: grid;
+  gap: 0.45rem;
+}
+.upload-created-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.9rem;
+  padding: 0.55rem 0.75rem;
+  border: 1px solid rgba(247, 239, 230, 0.14);
+  border-radius: 10px;
+  background: rgba(247, 239, 230, 0.03);
+}
+
+/* Content photos, videos, Instagram media and Higgsfield output on the Files
+   screen -- a second place to manage the same media the content library
+   manages (open, upload, delete). */
+.media-zip-note {
+  margin: 0.5rem 0 0;
+  font-size: 0.85rem;
+}
+.media-list {
+  margin-top: 0.85rem;
+}
+.media-row {
+  align-items: center;
+}
+.media-row-thumb {
+  width: 48px;
+  height: 48px;
+  flex-shrink: 0;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 1px solid rgba(247, 239, 230, 0.18);
+  background: rgba(247, 239, 230, 0.05);
+}
+.upload-badge.media-kind-image,
+.upload-badge.media-kind-video {
+  color: var(--paper);
+  border-color: rgba(247, 239, 230, 0.4);
+}
+.upload-badge.media-status {
+  color: var(--ember);
+  border-color: rgba(224, 137, 74, 0.5);
+}
+.media-library-note {
+  margin: 0.6rem 0 0;
+  font-size: 0.85rem;
+}
+.media-delete-confirm {
+  font-size: 0.8rem;
+  color: var(--paper-muted);
+  max-width: 18rem;
+}
+.media-job-list {
+  margin-top: 0.85rem;
+}
+.media-progress {
+  width: 100%;
+  max-width: 14rem;
+  height: 4px;
+  border-radius: 999px;
+  background: rgba(247, 239, 230, 0.14);
+  overflow: hidden;
+  margin: 0.25rem 0;
+}
+.media-progress span {
+  display: block;
+  height: 100%;
+  background: var(--ember);
+  border-radius: inherit;
+  transition: width 0.15s ease;
+}
+.atlanta-link {
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: var(--ember);
+  text-decoration: underline;
+  cursor: pointer;
+}
+.atlanta-link:hover,
+.atlanta-link:focus-visible {
+  color: var(--paper);
+}
+
+@media (max-width: 480px) {
+  .media-row {
+    flex-wrap: wrap;
+  }
+}

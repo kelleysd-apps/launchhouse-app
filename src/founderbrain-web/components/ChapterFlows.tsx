@@ -2,7 +2,7 @@
  * Later Typeform chapters: content (30 pieces / bottleneck / workflow) and outreach.
  * Maps onto existing missions without a second product surface.
  */
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   ContentAnswers,
   FounderTrack,
@@ -12,6 +12,14 @@ import type {
   OutreachAnswers,
 } from "../../founderbrain-shared/orientation";
 import type { UsageResponse } from "../types";
+import type {
+  GhlBookingLinkInput,
+  GhlBookingLinkKey,
+  GhlBookingLinkResult,
+  GhlBookingLinks,
+  GhlConnectionStatus,
+  GhlPushResult,
+} from "../../founderbrain-shared/ghl";
 import { ApiError } from "../api";
 import {
   contentScreens,
@@ -44,6 +52,11 @@ import {
   prospectLines,
 } from "../../founderbrain-shared/saturday-work.ts";
 import { useMedia } from "./Media";
+import {
+  GhlConnectionPanel,
+  ghlDestinationLabel,
+  isVerifiedGhlIdentity,
+} from "./GhlConnectionPanel";
 
 type ChapterProps = {
   orientation: OrientationState;
@@ -64,9 +77,7 @@ function fieldValue(answers: object, key: string | undefined): string {
 function textReady(key: string, value: string, track: "b2b" | "b2c" | null): string | null {
   if (key === "instagramHandle") {
     if (!value.trim()) return null;
-    return instagramHandleOk(value)
-      ? null
-      : "That handle is not usable. Leave it blank or fix it.";
+    return instagramHandleOk(value) ? null : "That handle is not usable. Leave it blank or fix it.";
   }
   if (key === "emailDomain") {
     return emailDomainOk(value) ? null : "Enter a real email domain before continuing.";
@@ -84,7 +95,8 @@ function textReady(key: string, value: string, track: "b2b" | "b2c" | null): str
       ? null
       : `Enter at least ${MIN_PROSPECTS} prospects with a name and an email. ${count} so far.`;
   }
-  if (key === "bottleneck" && value.trim().length < 2) return "Name the bottleneck before continuing.";
+  if (key === "bottleneck" && value.trim().length < 2)
+    return "Name the bottleneck before continuing.";
   return track ? null : null;
 }
 
@@ -199,7 +211,9 @@ export function ContentChapter({
   generating?: boolean;
   revising?: boolean;
   onGenerate?: () => void;
-  onRevise?: (pieces: Array<{ n: number; text: string; feedback: string }>) => Promise<Array<{ n: number; text: string }>>;
+  onRevise?: (
+    pieces: Array<{ n: number; text: string; feedback: string }>,
+  ) => Promise<Array<{ n: number; text: string }>>;
 }) {
   const screens = useMemo(() => contentScreens(orientation.track), [orientation.track]);
   const screen = Math.min(Math.max(orientation.contentScreen, 1), contentTotal);
@@ -235,7 +249,8 @@ export function ContentChapter({
     : [];
   const packProblem = contentPackBlock(artifactText, readyNumbers);
   const continueDisabled =
-    (isThirty && (Boolean(packProblem) || generating || (Boolean(mediaApi) && !pieceGate.loaded))) ||
+    (isThirty &&
+      (Boolean(packProblem) || generating || (Boolean(mediaApi) && !pieceGate.loaded))) ||
     (needsConfirm && !confirm) ||
     (needsText && Boolean(textProblem));
 
@@ -365,7 +380,9 @@ export function ContentChapter({
       ) : null}
       {isThirty && !mediaApi ? thirty : null}
       {isThirty ? (
-        packProblem ? <p className="entry-lede typeform-lede">{packProblem}</p> : null
+        packProblem ? (
+          <p className="entry-lede typeform-lede">{packProblem}</p>
+        ) : null
       ) : (
         <ScreenBody
           screen={current}
@@ -375,9 +392,7 @@ export function ContentChapter({
           onConfirm={setConfirm}
         />
       )}
-      {isChoice ? (
-        <p className="entry-lede typeform-lede">Choose below.</p>
-      ) : null}
+      {isChoice ? <p className="entry-lede typeform-lede">Choose below.</p> : null}
       {current.choices ? (
         <div className="typeform-choices">
           {current.choices.map((choice) => (
@@ -444,7 +459,8 @@ export function OutreachChapter({ orientation, saving, error, onPatch, onFinishe
         (answers as Record<string, boolean | string | undefined>)[current.confirm.key] = confirm;
       }
       if (current.textField) {
-        (answers as Record<string, boolean | string | undefined>)[current.textField.key] = text.trim();
+        (answers as Record<string, boolean | string | undefined>)[current.textField.key] =
+          text.trim();
       }
       if (screen >= outreachTotal) {
         const blocked = outreachFieldBlock({ ...orientation, outreachAnswers: answers });
@@ -592,6 +608,20 @@ export function GhlChapter({
   onFinished,
   connectEnabled = false,
   connecting = false,
+  disconnecting = false,
+  connection,
+  statusVerified = false,
+  statusLoading = false,
+  statusError = "",
+  connectionGeneration = 0,
+  bookingLinks,
+  bookingLoading = false,
+  bookingError = "",
+  linkSavingKey = null,
+  onRefreshStatus,
+  onDisconnect,
+  onLoadBookingLinks,
+  onSaveBookingLink,
   onConnect,
   loadUsage,
   onGhlPush,
@@ -601,11 +631,27 @@ export function GhlChapter({
 }: ChapterProps & {
   connectEnabled?: boolean;
   connecting?: boolean;
+  disconnecting?: boolean;
+  connection: GhlConnectionStatus | null;
+  statusVerified?: boolean;
+  statusLoading?: boolean;
+  statusError?: string;
+  connectionGeneration?: number;
+  bookingLinks: GhlBookingLinks | null;
+  bookingLoading?: boolean;
+  bookingError?: string;
+  linkSavingKey?: GhlBookingLinkKey | null;
   packAccepted?: boolean;
   packReady?: boolean;
   onReviewPack?: () => void;
-  onGhlPush?: () => Promise<{ snapshot: string; firstPack: string; pushed: string[]; skipped: string[]; proven: boolean; clinicPaste: string[] }>;
+  onGhlPush?: () => Promise<GhlPushResult | null>;
   onConnect?: () => void | Promise<void>;
+  onRefreshStatus: () => void | Promise<void>;
+  onDisconnect: () => Promise<boolean>;
+  onLoadBookingLinks: () => void | Promise<void>;
+  onSaveBookingLink: (
+    input: Omit<GhlBookingLinkInput, "connectionId">,
+  ) => Promise<GhlBookingLinkResult | null>;
   loadUsage?: () => Promise<UsageResponse>;
 }) {
   const screens = useMemo(
@@ -617,11 +663,18 @@ export function GhlChapter({
   const [localError, setLocalError] = useState("");
   const isChoice = Boolean(current.choices?.length);
   const isConnect = current.id === "ghl-connect";
-  const connected = orientation.ghlAnswers.connected === true;
+  const identityVerified = statusVerified && isVerifiedGhlIdentity(connection);
   const [pushing, setPushing] = useState(false);
-  const [pushed, setPushed] = useState(false);
-  const [pushResult, setPushResult] = useState<{ snapshot: string; firstPack: string; pushed: string[]; skipped: string[]; proven: boolean; clinicPaste: string[] } | null>(null);
+  const pushingRef = useRef<symbol | null>(null);
+  const [pushResult, setPushResult] = useState<GhlPushResult | null>(null);
   const [pushError, setPushError] = useState("");
+
+  useEffect(() => {
+    pushingRef.current = null;
+    setPushing(false);
+    setPushResult(null);
+    setPushError("");
+  }, [connectionGeneration]);
 
   async function persist(patch: OrientationPatch) {
     setLocalError("");
@@ -640,7 +693,9 @@ export function GhlChapter({
         await persist({
           ghlScreen: ghlTotal,
           ghlComplete: true,
-          ghlAnswers: orientation.ghlAnswers,
+          ghlAnswers: identityVerified
+            ? { ...orientation.ghlAnswers, connected: true }
+            : orientation.ghlAnswers,
         });
         onFinished();
         return;
@@ -672,33 +727,64 @@ export function GhlChapter({
     }
   }
 
+  async function pushCopy() {
+    if (pushingRef.current) return;
+    const operation = Symbol("ghl-push-ui");
+    pushingRef.current = operation;
+    setPushing(true);
+    setPushError("");
+    try {
+      const result = await (onGhlPush?.() ?? Promise.reject(new Error("unavailable")));
+      if (pushingRef.current !== operation || !result) return;
+      setPushResult(result);
+    } catch (e: unknown) {
+      if (pushingRef.current !== operation) return;
+      setPushError(
+        e instanceof ApiError
+          ? String(e.message).slice(0, 200)
+          : "Something went wrong starting the push. Try again.",
+      );
+    } finally {
+      if (pushingRef.current === operation) {
+        pushingRef.current = null;
+        setPushing(false);
+      }
+    }
+  }
+
+  const connectActionDisabled =
+    isConnect &&
+    (statusLoading || connecting || disconnecting || (!connection?.connected && !connectEnabled));
+  const continueLabel = isConnect
+    ? identityVerified
+      ? "Back to Home"
+      : connection?.connected === false
+        ? connectEnabled
+          ? "Connect GoHighLevel"
+          : "Connect is not configured"
+        : "Refresh status"
+    : "Continue";
+
   return (
     <TypeformShell
       kicker="Atlanta prep · GoHighLevel"
       screen={screen}
       total={ghlTotal}
       title={current.title}
-      continueLabel={
-        isConnect
-          ? connected
-            ? "Back to Home"
-            : connectEnabled
-              ? "Connect GoHighLevel"
-              : "Connect is not configured"
-          : "Continue"
-      }
+      continueLabel={continueLabel}
       hideContinue={isChoice}
-      continueDisabled={(isConnect && !connected && !connectEnabled)}
+      continueDisabled={connectActionDisabled}
       showBack={screen > 1}
       onBack={() => void goBack()}
       onContinue={() => {
-        if (isConnect && !connected && onConnect) {
-          void onConnect();
+        if (isConnect && !identityVerified) {
+          if (connection?.connected === false && onConnect) void onConnect();
+          else void onRefreshStatus();
           return;
         }
         void continueForward();
       }}
-      saving={saving || connecting}
+      saving={saving || connecting || disconnecting}
     >
       <ScreenBody
         screen={current}
@@ -708,65 +794,102 @@ export function GhlChapter({
         onConfirm={() => undefined}
       />
       {current.usage ? <UsagePrice loadUsage={loadUsage} /> : null}
-      {isChoice ? (
-        <p className="entry-lede typeform-lede">Choose below.</p>
+      {isChoice ? <p className="entry-lede typeform-lede">Choose below.</p> : null}
+      {isConnect ? (
+        <GhlConnectionPanel
+          connection={connection}
+          statusVerified={statusVerified}
+          statusLoading={statusLoading}
+          statusError={statusError}
+          connecting={connecting}
+          disconnecting={disconnecting}
+          connectEnabled={connectEnabled}
+          generation={connectionGeneration}
+          bookingLinks={bookingLinks}
+          bookingLoading={bookingLoading}
+          bookingError={bookingError}
+          linkSavingKey={linkSavingKey}
+          onRefresh={onRefreshStatus}
+          onConnect={onConnect ?? (() => undefined)}
+          onDisconnect={onDisconnect}
+          onLoadBookingLinks={onLoadBookingLinks}
+          onSaveBookingLink={onSaveBookingLink}
+        />
       ) : null}
-      {isConnect && connected ? (
-        <p className="entry-lede typeform-lede">Connected. You can leave this chapter.</p>
-      ) : null}
-      {isConnect && connected && !pushed && !packAccepted ? (
-        <div className="mission-save-row">
+      {isConnect && identityVerified && !pushResult?.proven && !packAccepted ? (
+        <div className="mission-save-row ghl-workflow-card">
           <p className="entry-lede typeform-lede">
-            Review and accept the content, outreach, and 90 day plan before anything is written to GoHighLevel.
+            Review and accept the content, outreach, and 90 day plan before anything is written to
+            GoHighLevel.
           </p>
           {packReady ? (
             <button type="button" className="typeform-external" onClick={onReviewPack}>
               Review the pack
             </button>
           ) : (
-            <p className="entry-lede typeform-lede">Use Update to V2 first. That writes the pack you review here.</p>
+            <p className="entry-lede typeform-lede">
+              Use Update to V2 first. That writes the pack you review here.
+            </p>
           )}
         </div>
       ) : null}
-      {isConnect && connected && !pushed && packAccepted ? (
-        <div className="mission-save-row">
+      {isConnect && identityVerified && packAccepted && !pushResult?.proven ? (
+        <div className="mission-save-row ghl-workflow-card">
           <button
             type="button"
             className="typeform-external"
-            onClick={() => {
-              setPushing(true);
-              setPushError("");
-              void (onGhlPush?.() ?? Promise.reject(new Error("unavailable")))
-                .then((result) => {
-                  setPushResult(result);
-                  setPushed(true);
-                })
-                .catch((e: unknown) => {
-                  setPushing(false);
-                  // Known API failures (our own DomainError mapping) carry a founder-safe
-                  // message. Anything else is a raw internal TypeError - #77 surfaced the
-                  // Hexclave SDK's "Cannot read properties of undefined (reading 'has')"
-                  // straight into the chapter. Never print internals to a founder.
-                  setPushError(
-                    e instanceof ApiError
-                      ? String(e.message).slice(0, 200)
-                      : "Something went wrong starting the push. Try again.",
-                  );
-                });
-            }}
-            disabled={pushing || saving}
+            onClick={() => void pushCopy()}
+            disabled={pushing || saving || disconnecting}
           >
             {pushing ? "Writing your copy into GoHighLevel…" : "Fill my workflow copy"}
           </button>
+          <p>
+            Copy goes to {ghlDestinationLabel(connection)}. Booking-link transfer is the separate
+            control above and does not regenerate copy or use AI.
+          </p>
         </div>
       ) : null}
       {pushResult ? (
-        <p className="entry-lede typeform-lede">
-          Snapshot {pushResult.snapshot} · first pack {pushResult.firstPack} · {pushResult.pushed.length} values written
-          {pushResult.skipped.length ? `, ${pushResult.skipped.length} already had your words` : ""} · verified in
-          GoHighLevel: {pushResult.proven ? "yes" : "unverified"}
-          {pushResult.clinicPaste.length ? ` Paste by hand at the clinic: ${pushResult.clinicPaste.join(", ")}.` : ""}
-        </p>
+        <div className={`ghl-push-receipt ${pushResult.proven ? "verified" : "unverified"}`}>
+          <h3>{pushResult.proven ? "Workflow copy verified" : "Workflow copy needs a check"}</h3>
+          <p>
+            Destination: <strong>{ghlDestinationLabel(pushResult.connection)}</strong>
+            {pushResult.connection.locationId ? ` (${pushResult.connection.locationId})` : ""}.
+          </p>
+          <p>
+            Snapshot {pushResult.snapshot} · first pack {pushResult.firstPack} ·{" "}
+            {pushResult.pushed.length} values written
+            {pushResult.skipped.length ? ` · ${pushResult.skipped.length} existing values preserved` : ""}.
+          </p>
+          {!pushResult.proven ? (
+            <p role="alert">
+              GoHighLevel did not verify the exact copy. Refresh status, check the destination, and
+              retry. This is not marked complete.
+            </p>
+          ) : null}
+          {pushResult.clinicPaste.length ? (
+            <div className="ghl-pending-links">
+              <strong>Add the booking link in the form above.</strong>
+              <ul>
+                {pushResult.clinicPaste.map((name) => (
+                  <li key={name}>{name}</li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          {pushResult.held.length ? (
+            <div className="ghl-pending-links">
+              <strong>Still held:</strong>
+              <ul>
+                {pushResult.held.map((item) => (
+                  <li key={`${item.code}:${item.name}`}>
+                    {item.name}: {item.reason}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+        </div>
       ) : null}
       {pushError ? (
         <p className="entry-error" role="alert">

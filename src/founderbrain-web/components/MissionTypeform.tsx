@@ -9,6 +9,7 @@ import { ChannelPicker } from "./ChannelPicker";
 import { Output } from "./Output";
 import type { QuestionIndexConfig, QuestionIndexItem } from "./QuestionIndexModal";
 import { missionFieldStatus, missingMissionFields, resumeQuestion } from "../lib/mission-index";
+import { toQuestionKey } from "../lib/uploads";
 import { VoiceSampleGate } from "./VoiceSampleGate";
 import { TypeformShell } from "./TypeformShell";
 import { VoiceField } from "./VoiceField";
@@ -574,6 +575,7 @@ export function MissionTypeform(props: {
               serverTranscribe={props.onTranscribe}
               onEnter={commitNeither}
               onChange={(next) => props.onPatch("identity", "modelNote", next)}
+              questionKey={toQuestionKey("identity", "modelNote")}
             />
           ) : null}
           <p className="entry-lede typeform-lede">
@@ -657,6 +659,7 @@ export function MissionTypeform(props: {
               serverTranscribe={props.onTranscribe}
               onEnter={def.kind === "text" ? advance : undefined}
               onChange={(next) => props.onPatch(current.mission, def.field, next)}
+              questionKey={toQuestionKey(current.mission, def.field)}
             />
           )}
         </>

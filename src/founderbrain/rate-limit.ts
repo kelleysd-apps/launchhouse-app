@@ -74,17 +74,29 @@ export const MUTATION_PATHS = new Set([
   "DELETE /api/workspace",
   "POST /api/oauth/complete",
   "POST /api/site-import",
-  "POST /api/gmail/oauth/start", "POST /api/gmail/oauth/complete", "DELETE /api/gmail",
-  "GET /api/gmail/sent", "POST /api/gmail/voice", "POST /api/gmail/drafts",
-  "PUT /api/gmail/drafts/:id", "POST /api/gmail/drafts/:id/save", "POST /api/gmail/drafts/:id/send",
+  "POST /api/gmail/oauth/start",
+  "POST /api/gmail/oauth/complete",
+  "DELETE /api/gmail",
+  "GET /api/gmail/sent",
+  "POST /api/gmail/voice",
+  "POST /api/gmail/drafts",
+  "PUT /api/gmail/drafts/:id",
+  "POST /api/gmail/drafts/:id/save",
+  "POST /api/gmail/drafts/:id/send",
   "PUT /api/gmail/settings",
+  "POST /api/uploads",
+  "DELETE /api/uploads/:id",
 ]);
 
 export function mutationKey(method: string, path: string): string {
   const bare = path.split("?")[0] ?? path;
   if (method === "POST" && /^\/api\/artifact\/[^/]+\/accept$/.test(bare))
     return "POST /api/artifact/:id/accept";
-  if ((method === "PUT" || method === "POST") && /^\/api\/gmail\/drafts\/[^/]+(?:\/(?:save|send))?$/.test(bare))
+  if (
+    (method === "PUT" || method === "POST") &&
+    /^\/api\/gmail\/drafts\/[^/]+(?:\/(?:save|send))?$/.test(bare)
+  )
     return method + " " + bare.replace(/(\/api\/gmail\/drafts\/)[^/]+/, "$1:id");
+  if (method === "DELETE" && /^\/api\/uploads\/[^/]+$/.test(bare)) return "DELETE /api/uploads/:id";
   return method + " " + bare;
 }
